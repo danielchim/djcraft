@@ -24,10 +24,12 @@ is the full plan, with the status of every item.
   waveforms are cached between runs.
 - **Track browser:** the library and playlists sit under the decks; double-click
   a track to load it.
+- **Tempo analysis:** tracks are analysed in the background for BPM and beat
+  positions. It assumes a steady tempo, as most dance music has.
 - **Settings:** theme, start-up tab, start-up scanning and lookup provider.
 
-The Radio tab, live broadcasting, remote sessions, effects, the mixer, track
-analysis (BPM, key, energy) and plugins are planned but not built.
+The Radio tab, live broadcasting, remote sessions, effects, the mixer, key and
+energy analysis and plugins are planned but not built.
 
 ## Building
 
@@ -69,6 +71,7 @@ Your music files are only changed when you press Save in the track info panel.
 |---|---|
 | `crates/protocol` | The control protocol: every user action and the session state |
 | `crates/engine` | Audio engine: decoding, decks, mixing, time-stretch. No UI code |
+| `crates/analysis` | Signal analysis on decoded audio: tempo and beat positions |
 | `crates/library` | Library database, scanning, tags, playlists, import, lookups |
 | `crates/app` | The desktop application |
 

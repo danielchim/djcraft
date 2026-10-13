@@ -1,3 +1,4 @@
+mod analysis;
 mod library_view;
 mod settings;
 mod settings_view;

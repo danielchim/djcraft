@@ -167,6 +167,20 @@ impl Track {
         }
     }
 
+    /// Everything decoded so far, mixed down to one channel, for analysis.
+    pub fn mono(&self) -> Vec<f32> {
+        self.samples[..self.decoded_frames() * CHANNELS]
+            .chunks_exact(CHANNELS)
+            .map(|frame| {
+                let sum: f32 = frame
+                    .iter()
+                    .map(|slot| f32::from_bits(slot.load(Ordering::Relaxed)))
+                    .sum();
+                sum / CHANNELS as f32
+            })
+            .collect()
+    }
+
     pub fn frames_per_peak(&self) -> usize {
         FRAMES_PER_PEAK
     }

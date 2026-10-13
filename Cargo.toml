@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/app", "crates/engine", "crates/library", "crates/protocol"]
+members = ["crates/analysis","crates/app", "crates/engine", "crates/library", "crates/protocol"]
 
 [workspace.package]
 version = "0.1.0"
@@ -15,4 +15,7 @@ gpui-kit = "0.7.3"
 opt-level = 3
 
 [profile.dev.package.djcraft-engine]
+opt-level = 3
+
+[profile.dev.package.djcraft-analysis]
 opt-level = 3

@@ -22,6 +22,8 @@ use gpui_kit::*;
 
 /// How often the track list is refreshed while a scan is running.
 const SCAN_REFRESH: Duration = Duration::from_millis(400);
+/// How often it is refreshed while tracks are being analysed.
+const ANALYSIS_REFRESH: Duration = Duration::from_secs(2);
 
 /// A section of the library, chosen from the rail on the left.
 #[derive(Clone, Copy, PartialEq)]
@@ -365,6 +367,9 @@ pub struct LibraryView {
     editing: bool,
     running_scans: usize,
     scan_counters: Arc<ScanCounters>,
+    /// Whether tracks are being analysed in the background.
+    analysing: bool,
+    analysis: Arc<crate::analysis::Progress>,
 }
 
 impl LibraryView {
@@ -453,6 +458,8 @@ impl LibraryView {
             editing: false,
             running_scans: 0,
             scan_counters: Arc::default(),
+            analysing: false,
+            analysis: Arc::default(),
         };
         view.show_section(Section::Library, cx);
         // Pick up anything that changed on disk since the last run.
@@ -465,7 +472,51 @@ impl LibraryView {
         for source in sources {
             view.scan(source.id, cx);
         }
+        view.analyse(cx);
         view
+    }
+
+    /// Analyses tracks that have not been analysed yet, in the background,
+    /// showing results as they come in. Does nothing if already under way.
+    fn analyse(&mut self, cx: &mut Context<Self>) {
+        if self.compact || self.analysing || self.library.is_none() {
+            return;
+        }
+        self.analysing = true;
+        let db_path = self.db_path.clone();
+        let progress = self.analysis.clone();
+        let work = cx
+            .background_spawn(async move { crate::analysis::analyse_pending(&db_path, &progress) });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            this.update(cx, |this, cx| {
+                this.analysing = false;
+                let analysed_some = this.analysis.total.load(AtomicOrdering::Relaxed) > 0;
+                match result {
+                    // Tracks may have been added while this pass was busy;
+                    // go round again until a pass finds nothing to do.
+                    Ok(()) if analysed_some => this.analyse(cx),
+                    Ok(()) => {}
+                    Err(error) => this.error = Some(error.to_string().into()),
+                }
+                this.reload(cx);
+            })
+            .ok();
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(ANALYSIS_REFRESH).await;
+                let analysing = this.update(cx, |this, cx| {
+                    this.reload(cx);
+                    this.analysing
+                });
+                if !analysing.unwrap_or(false) {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Re-reads the sources and the visible tracks from the database.
@@ -987,6 +1038,7 @@ impl LibraryView {
                     Err(error) => this.error = Some(error.to_string().into()),
                 }
                 this.reload(cx);
+                this.analyse(cx);
             })
             .ok();
         })
@@ -1058,6 +1110,10 @@ impl LibraryView {
                     this.error = Some(error.to_string().into());
                 }
                 this.reload(cx);
+                // Whatever the scan found needs analysing.
+                if this.running_scans == 0 {
+                    this.analyse(cx);
+                }
             })
             .ok();
         })
@@ -1471,6 +1527,10 @@ impl LibraryView {
         } else if self.running_scans > 0 {
             let done = self.scan_counters.done.load(AtomicOrdering::Relaxed);
             format!("Scanning {done} of {total}…")
+        } else if self.analysing {
+            let done = self.analysis.done.load(AtomicOrdering::Relaxed);
+            let total = self.analysis.total.load(AtomicOrdering::Relaxed);
+            format!("{count} tracks · analysing {done} of {total}…")
         } else if count == 1 {
             "1 track".into()
         } else {

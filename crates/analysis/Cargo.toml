@@ -1,0 +1,11 @@
+[package]
+name = "djcraft-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rustfft = "6.4.1"
+
+[dev-dependencies]
+djcraft-engine = { path = "../engine" }

@@ -13,6 +13,7 @@ cargo clippy --workspace --all-targets
 cargo deny check licenses sources            # needs cargo-deny installed
 cargo run -p djcraft-library --example scan -- <library.db> <folder>
 cargo run -p djcraft-library --example lookup -- <artist> <title>
+cargo run -p djcraft-analysis --example tempo -- <audio file>...
 ```
 
 Run the tests, `cargo fmt` and the licence check before finishing a change.
@@ -23,6 +24,8 @@ alone.
 
 - `crates/protocol`: control protocol types. Pure data, no I/O.
 - `crates/engine`: audio engine. Must not depend on any UI crate.
+- `crates/analysis`: DSP on decoded samples (tempo so far). No file or
+  database access; the app decodes, analyses and stores.
 - `crates/library`: SQLite library, scanning, tags, playlists, import, lookups.
 - `crates/app`: the GPUI application. `shell.rs` is the window, `library_view.rs`
   the Library tab and the track browser, `settings_view.rs` the settings dialog.

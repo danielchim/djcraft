@@ -1627,12 +1627,21 @@ name = "djcraft"
 version = "0.1.0"
 dependencies = [
  "dirs 7.0.0",
+ "djcraft-analysis",
  "djcraft-engine",
  "djcraft-library",
  "djcraft-protocol",
  "gpui-kit",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "djcraft-analysis"
+version = "0.1.0"
+dependencies = [
+ "djcraft-engine",
+ "rustfft",
 ]
 
 [[package]]

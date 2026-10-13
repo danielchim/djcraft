@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 dirs = "7.0.0"
+djcraft-analysis = { version = "0.1.0", path = "../analysis" }
 djcraft-engine = { version = "0.1.0", path = "../engine" }
 djcraft-library = { version = "0.1.0", path = "../library" }
 djcraft-protocol = { version = "0.1.0", path = "../protocol" }

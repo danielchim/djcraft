@@ -124,7 +124,8 @@ pub(crate) fn file_stamp(path: &Path) -> Option<(i64, i64)> {
 }
 
 /// Reads a file's tags and stores it as a track, replacing what was known
-/// about the same file. Its id and playlist memberships are kept.
+/// about the same file. Its id and playlist memberships are kept, and it
+/// is marked as needing analysis again.
 pub(crate) fn store_track(
     conn: &Connection,
     source_id: i64,
@@ -141,7 +142,8 @@ pub(crate) fn store_track(
              title = excluded.title, artist = excluded.artist,
              album = excluded.album, genre = excluded.genre,
              duration = excluded.duration, bpm = excluded.bpm, key = excluded.key,
-             file_size = excluded.file_size, modified_at = excluded.modified_at",
+             file_size = excluded.file_size, modified_at = excluded.modified_at,
+             tempo_version = NULL",
         params![
             source_id,
             locator,
@@ -164,18 +166,46 @@ impl Library {
     /// Changes a track's details. They are written to the file's tags
     /// first, so the file stays the record of what the track is.
     pub fn edit_track(&self, id: i64, edit: &TrackEdit) -> Result<()> {
-        let (source_id, root, locator): (i64, String, String) = self.conn.query_row(
-            "SELECT t.source_id, s.location, t.locator
-             FROM tracks t JOIN sources s ON s.id = t.source_id WHERE t.id = ?1",
-            [id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        type Row = (i64, String, String, Option<f64>, Option<i64>);
+        let (source_id, root, locator, shown_bpm, tempo_version): Row = self.conn.query_row(
+            "SELECT t.source_id, s.location, t.locator,
+                        CASE WHEN t.bpm_manual = 0 AND t.tempo_confidence >= ?2
+                             THEN t.tempo_bpm ELSE t.bpm END,
+                        t.tempo_version
+                 FROM tracks t JOIN sources s ON s.id = t.source_id WHERE t.id = ?1",
+            params![id, crate::MIN_TEMPO_CONFIDENCE],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )?;
         let path = Path::new(&root).join(&locator);
         write_tags(&path, edit)?;
         let stamp = file_stamp(&path)
             .ok_or_else(|| Error::Tags(format!("{} disappeared", path.display())))?;
         // Re-read what the file now says, rather than trust the request.
-        store_track(&self.conn, source_id, &locator, &path, stamp)
+        store_track(&self.conn, source_id, &locator, &path, stamp)?;
+        // Only the tags changed, so the audio need not be analysed again.
+        // A tempo the user typed in stands until they change it.
+        let same_bpm = match (edit.bpm, shown_bpm) {
+            (Some(new), Some(shown)) => (new - shown).abs() < 0.005,
+            (None, None) => true,
+            _ => false,
+        };
+        self.conn.execute(
+            "UPDATE tracks SET tempo_version = ?2 WHERE id = ?1",
+            params![id, tempo_version],
+        )?;
+        if !same_bpm {
+            self.conn
+                .execute("UPDATE tracks SET bpm_manual = 1 WHERE id = ?1", [id])?;
+        }
+        Ok(())
     }
 
     /// Brings a source up to date with what is on disk: new files are added,

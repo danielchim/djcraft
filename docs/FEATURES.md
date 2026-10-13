@@ -48,11 +48,13 @@ Status key: `[ ]` to do, `[~]` in progress, `[x]` done.
 
 ### Analysis
 
-- [ ] BPM and beat grid detection
+- [~] BPM and beat grid detection (constant-tempo tracks, analysed in the
+      background; the grid is stored but not drawn yet, and bars are not
+      detected)
 - [ ] Key detection
 - [ ] Waveform generation (overview and detail)
-- [~] Analysis cache stored alongside the library database (waveforms are
-      cached in the user cache folder; no library database yet)
+- [~] Analysis cache stored alongside the library database (tempo results
+      are in the library database; waveforms are in the user cache folder)
 - [ ] Tempo range limits (minimum and maximum BPM) and precision setting
 - [ ] Option to keep an existing tempo or key instead of overwriting it
 

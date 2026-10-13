@@ -18,7 +18,12 @@ use rusqlite::{Connection, OptionalExtension, params};
 pub use import::{ImportSummary, ImportedPlaylist, read_playlists};
 pub use scan::{Artwork, ScanProgress, ScanSummary, TrackEdit, read_artwork};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
+
+/// A measured tempo is shown only when the analysis was at least this sure
+/// of it. Below that (mixes with several tempos, music with no clear beat)
+/// the tempo in the file's tags is shown instead.
+const MIN_TEMPO_CONFIDENCE: f64 = 0.1;
 
 #[derive(Debug)]
 pub enum Error {
@@ -95,8 +100,19 @@ pub struct Track {
     pub album: String,
     pub genre: String,
     pub duration_seconds: f64,
+    /// The measured tempo when there is a trustworthy one, otherwise the
+    /// tempo from the file's tags.
     pub bpm: Option<f64>,
     pub key: Option<String>,
+}
+
+/// What tempo analysis found for a track.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TempoResult {
+    pub bpm: f64,
+    pub first_beat_seconds: f64,
+    /// 0.0 to 1.0.
+    pub confidence: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -196,7 +212,79 @@ impl Library {
                  COMMIT;",
             )?;
         }
+        if version < 3 {
+            // Results of tempo analysis. `tempo_version` says which version
+            // of the analysis produced them; it is NULL for a track that has
+            // not been analysed since its file last changed.
+            // `bpm_manual` marks a tempo the user typed in, which analysis
+            // must not replace.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE tracks ADD COLUMN tempo_bpm REAL;
+                 ALTER TABLE tracks ADD COLUMN tempo_first_beat REAL;
+                 ALTER TABLE tracks ADD COLUMN tempo_confidence REAL;
+                 ALTER TABLE tracks ADD COLUMN tempo_version INTEGER;
+                 ALTER TABLE tracks ADD COLUMN bpm_manual INTEGER NOT NULL DEFAULT 0;
+                 PRAGMA user_version = 3;
+                 COMMIT;",
+            )?;
+        }
         Ok(Self { conn })
+    }
+
+    /// Tracks whose tempo has not been analysed by this `version` of the
+    /// analysis, or whose file has changed since it was.
+    pub fn pending_tempo_analysis(&self, version: i64) -> Result<Vec<(i64, PathBuf)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT t.id, s.location, t.locator
+             FROM tracks t JOIN sources s ON s.id = t.source_id
+             WHERE t.tempo_version IS NULL OR t.tempo_version < ?1
+             ORDER BY t.id",
+        )?;
+        let rows = statement.query_map([version], |row| {
+            let root: String = row.get(1)?;
+            let locator: String = row.get(2)?;
+            Ok((row.get(0)?, Path::new(&root).join(locator)))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Records the outcome of tempo analysis; `None` when no steady tempo
+    /// was found. Either way the track is not analysed again until its file
+    /// or the analysis version changes.
+    pub fn store_tempo(&self, id: i64, version: i64, tempo: Option<TempoResult>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tracks SET tempo_bpm = ?2, tempo_first_beat = ?3, tempo_confidence = ?4,
+                               tempo_version = ?5
+             WHERE id = ?1",
+            params![
+                id,
+                tempo.map(|t| t.bpm),
+                tempo.map(|t| t.first_beat_seconds),
+                tempo.map(|t| t.confidence),
+                version
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The beat grid measured for a track: its tempo and first beat.
+    pub fn beat_grid(&self, id: i64) -> Result<Option<TempoResult>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT tempo_bpm, tempo_first_beat, tempo_confidence FROM tracks
+                 WHERE id = ?1 AND tempo_bpm IS NOT NULL AND tempo_confidence >= ?2",
+                params![id, MIN_TEMPO_CONFIDENCE],
+                |row| {
+                    Ok(TempoResult {
+                        bpm: row.get(0)?,
+                        first_beat_seconds: row.get(1)?,
+                        confidence: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
     }
 
     pub fn create_playlist(&self, name: &str) -> Result<Playlist> {
@@ -328,13 +416,19 @@ impl Library {
     pub fn tracks(&self, query: &TrackQuery) -> Result<Vec<Track>> {
         let mut sql = String::from(
             "SELECT t.id, t.source_id, s.location, t.locator, t.title, t.artist, t.album,
-                    t.genre, t.duration, t.bpm, t.key
+                    t.genre, t.duration,
+                    CASE WHEN t.bpm_manual = 0 AND t.tempo_confidence >= ?3
+                         THEN t.tempo_bpm ELSE t.bpm END,
+                    t.key
              FROM tracks t JOIN sources s ON s.id = t.source_id
              LEFT JOIN playlist_tracks pt ON pt.track_id = t.id AND pt.playlist_id = ?2
              WHERE (?1 IS NULL OR t.source_id = ?1) AND (?2 IS NULL OR pt.track_id IS NOT NULL)",
         );
-        let mut values: Vec<rusqlite::types::Value> =
-            vec![query.source.into(), query.playlist.into()];
+        let mut values: Vec<rusqlite::types::Value> = vec![
+            query.source.into(),
+            query.playlist.into(),
+            MIN_TEMPO_CONFIDENCE.into(),
+        ];
         for word in query.search.split_whitespace() {
             let escaped = word
                 .replace('\\', "\\\\")

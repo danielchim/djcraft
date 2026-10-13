@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use djcraft_library::{
-    ImportSummary, Library, ScanSummary, SourceKind, TrackEdit, TrackQuery, read_artwork,
-    read_playlists,
+    ImportSummary, Library, ScanSummary, SourceKind, TempoResult, TrackEdit, TrackQuery,
+    read_artwork, read_playlists,
 };
 use lofty::config::WriteOptions;
 use lofty::tag::{Accessor, ItemKey, Tag, TagExt, TagType};
@@ -328,12 +328,21 @@ fn an_existing_library_gains_playlists_on_upgrade() {
     drop(Library::open(&db).unwrap());
     // Put the file back to how the first schema left it.
     let raw = rusqlite::Connection::open(&db).unwrap();
-    raw.execute_batch("DROP TABLE playlist_tracks; DROP TABLE playlists; PRAGMA user_version = 1;")
-        .unwrap();
+    raw.execute_batch(
+        "DROP TABLE playlist_tracks; DROP TABLE playlists;
+         ALTER TABLE tracks DROP COLUMN tempo_bpm;
+         ALTER TABLE tracks DROP COLUMN tempo_first_beat;
+         ALTER TABLE tracks DROP COLUMN tempo_confidence;
+         ALTER TABLE tracks DROP COLUMN tempo_version;
+         ALTER TABLE tracks DROP COLUMN bpm_manual;
+         PRAGMA user_version = 1;",
+    )
+    .unwrap();
     drop(raw);
 
     let library = Library::open(&db).unwrap();
     assert_eq!(library.create_playlist("New").unwrap().name, "New");
+    assert!(library.pending_tempo_analysis(1).unwrap().is_empty());
 }
 
 fn file_url(path: &Path) -> String {
@@ -603,4 +612,82 @@ fn editing_a_track_writes_its_tags() {
     assert!(bpms.contains(&Some(127.5)) && bpms.contains(&None));
 
     assert!(read_artwork(&dir.0.join("bare.wav")).is_none());
+}
+
+#[test]
+fn measured_tempo_is_stored_and_shown() {
+    let dir = TempDir::new("tempo");
+    write_tagged(&dir.0.join("a.wav"), "Tagged", "A", "", "100", "1A");
+    write_wav(&dir.0.join("b.wav"));
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let bpm_of = |library: &Library, title: &str| {
+        let all = library.tracks(&TrackQuery::default()).unwrap();
+        all.into_iter().find(|t| t.title == title).unwrap().bpm
+    };
+
+    let pending = library.pending_tempo_analysis(1).unwrap();
+    assert_eq!(pending.len(), 2);
+    let id_of = |name: &str| {
+        pending
+            .iter()
+            .find(|(_, path)| path.ends_with(name))
+            .unwrap()
+            .0
+    };
+    let (tagged, bare) = (id_of("a.wav"), id_of("b.wav"));
+
+    // A confident measurement replaces the tag's tempo in listings.
+    let sure = TempoResult {
+        bpm: 128.02,
+        first_beat_seconds: 0.25,
+        confidence: 0.4,
+    };
+    library.store_tempo(tagged, 1, Some(sure)).unwrap();
+    assert_eq!(bpm_of(&library, "Tagged"), Some(128.02));
+    assert_eq!(library.beat_grid(tagged).unwrap(), Some(sure));
+
+    // A doubtful one, or none at all, leaves the track as it was.
+    let unsure = TempoResult {
+        bpm: 87.0,
+        first_beat_seconds: 0.0,
+        confidence: 0.03,
+    };
+    library.store_tempo(bare, 1, Some(unsure)).unwrap();
+    assert_eq!(bpm_of(&library, "b"), None);
+    assert_eq!(library.beat_grid(bare).unwrap(), None);
+
+    // Analysed tracks are not offered again, until the analysis improves.
+    assert!(library.pending_tempo_analysis(1).unwrap().is_empty());
+    assert_eq!(library.pending_tempo_analysis(2).unwrap().len(), 2);
+
+    // Editing other details keeps the measurement and needs no re-analysis.
+    let mut edit = TrackEdit {
+        title: "Renamed".into(),
+        artist: "A".into(),
+        album: String::new(),
+        genre: String::new(),
+        bpm: Some(128.02),
+        key: None,
+    };
+    library.edit_track(tagged, &edit).unwrap();
+    assert_eq!(bpm_of(&library, "Renamed"), Some(128.02));
+    assert!(library.pending_tempo_analysis(1).unwrap().is_empty());
+
+    // A tempo typed in by hand wins over the measurement from then on.
+    edit.bpm = Some(64.0);
+    library.edit_track(tagged, &edit).unwrap();
+    assert_eq!(bpm_of(&library, "Renamed"), Some(64.0));
+    library.store_tempo(tagged, 2, Some(sure)).unwrap();
+    assert_eq!(bpm_of(&library, "Renamed"), Some(64.0));
+
+    // A file that changes on disk is analysed again.
+    write_tagged(&dir.0.join("b.wav"), "Now Tagged", "B", "", "90", "2A");
+    library.scan(source.id, |_| {}).unwrap();
+    let pending = library.pending_tempo_analysis(1).unwrap();
+    assert_eq!(
+        pending.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        [bare]
+    );
 }
