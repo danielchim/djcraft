@@ -6,17 +6,18 @@
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use djcraft_engine::Engine;
 use djcraft_protocol::{Action, DeckAction, DeckState, Role};
 
 use djcraft_library::{
-    ClipPlacement, CuePoint, FLOW_LANES, Flow, FlowClip, Library, MIN_CLIP_SECONDS, TempoResult,
-    Track,
+    ClipPlacement, CuePoint, FLOW_LANES, Flow, FlowClip, Library, MAX_CLIP_SPEED, MIN_CLIP_SECONDS,
+    MIN_CLIP_SPEED, TempoResult, Track,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Sizable, WindowExt,
+    ActiveTheme, Disableable, Selectable, Sizable, WindowExt,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
     menu::{DropdownMenu, PopupMenuItem},
@@ -25,13 +26,11 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::library_view::{DraggedTrack, LibraryEvent, LibraryView, key_colour};
+use crate::library_view::{DraggedTrack, LibraryEvent, LibraryView, key_colour, wheel_display};
 
 const LANE_HEIGHT: f32 = 56.;
 const RULER_HEIGHT: f32 = 22.;
 const HINTS_HEIGHT: f32 = 24.;
-/// How close to a clip's end the pointer must be to trim instead of move.
-const TRIM_GRIP: f32 = 8.;
 /// How close, on screen, a moved clip's edge must come to another clip's
 /// edge to snap to it.
 const SNAP_PIXELS: f32 = 6.;
@@ -48,15 +47,46 @@ const UNTITLED: &str = "Untitled flow";
 /// The most cue points a track may have.
 const MAX_CUES: usize = 8;
 const PLAYER_WAVE_HEIGHT: f32 = 72.;
+/// Width of the grab area on each end of a block.
+const HANDLE_WIDTH: f32 = 12.;
+/// How close a stretched tempo must come to a neighbour's to lock onto it.
+const TEMPO_MAGNET_BPM: f64 = 0.6;
 
+/// Which part of a block was grabbed.
 #[derive(Clone, Copy, PartialEq)]
-enum DragMode {
-    Move,
-    TrimStart,
-    TrimEnd,
+enum Grip {
+    Body,
+    Start,
+    End,
 }
 
-/// A clip being moved or trimmed with the mouse.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DragMode {
+    Move,
+    /// Cutting: the edge moves through the track, which keeps its tempo.
+    TrimStart,
+    TrimEnd,
+    /// Stretching: the same music is squeezed or spread, changing its tempo.
+    StretchStart,
+    StretchEnd,
+}
+
+/// What a held clip is measured against as it is dragged.
+struct DragContext<'a> {
+    track_seconds: f64,
+    grid: Option<TempoResult>,
+    cues: &'a [CuePoint],
+    /// The track's own tempo, if known.
+    bpm: Option<f64>,
+    /// Start and end times of the other clips.
+    edges: &'a [f64],
+    /// Tempos of the clips this one overlaps.
+    neighbour_bpms: &'a [f64],
+    /// How close, in seconds of timeline, counts as near enough to snap.
+    reach: f64,
+}
+
+/// A clip being moved, trimmed or stretched with the mouse.
 struct ClipDrag {
     clip: i64,
     mode: DragMode,
@@ -75,6 +105,8 @@ pub struct FlowView {
     clips: Vec<FlowClip>,
     selected: Option<i64>,
     drag: Option<ClipDrag>,
+    /// Whether dragging a block's edge stretches it instead of cutting.
+    stretch: bool,
     /// Pixels per second of timeline.
     zoom: f32,
     /// Where the lanes are on screen, as of the last frame.
@@ -88,6 +120,10 @@ pub struct FlowView {
     cues: Vec<CuePoint>,
     /// Where the player's waveform is on screen, as of the last frame.
     wave: Rc<Cell<Bounds<Pixels>>>,
+    /// Whether the player's key panel is showing.
+    key_open: bool,
+    /// When that panel was last closed by a click outside it.
+    key_dismissed: Option<Instant>,
     /// Keyboard focus for the timeline, so Delete reaches it.
     focus: FocusHandle,
     browser: Entity<LibraryView>,
@@ -125,6 +161,7 @@ impl FlowView {
             clips: Vec::new(),
             selected: None,
             drag: None,
+            stretch: false,
             zoom: 3.,
             lanes: Rc::default(),
             name,
@@ -132,11 +169,11 @@ impl FlowView {
             playing: None,
             cues: Vec::new(),
             wave: Rc::default(),
+            key_open: false,
+            key_dismissed: None,
             focus: cx.focus_handle(),
             browser,
         };
-        view.reload(cx);
-        view.flow = view.flows.first().map(|f| f.id);
         view.reload(cx);
         view
     }
@@ -386,7 +423,7 @@ impl FlowView {
                     None => DEFAULT_OVERLAP_SECONDS,
                 };
                 // Never more than half the clip being mixed out of.
-                let overlap = overlap.min(last.length / 2.);
+                let overlap = overlap.min(last.duration() / 2.);
                 ((last.lane + 1) % 2, last.end() - overlap)
             }
         };
@@ -399,6 +436,7 @@ impl FlowView {
                     start,
                     offset,
                     length: f64::MAX,
+                    speed: 1.,
                 };
                 library.place_clip(clip, placement)?;
             }
@@ -426,32 +464,33 @@ impl FlowView {
         });
     }
 
-    fn begin_drag(&mut self, clip: i64, position: Point<Pixels>, cx: &mut Context<Self>) {
+    /// Takes hold of a block. `other_mode` (the Alt key) swaps cutting and
+    /// stretching for this one drag.
+    fn begin_drag(
+        &mut self,
+        clip: i64,
+        grip: Grip,
+        other_mode: bool,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(found) = self.clips.iter().find(|c| c.id == clip) else {
             return;
         };
-        let (time, _) = self.locate(position);
-        let from_start = ((time - found.start) as f32 * self.zoom).max(0.);
-        let from_end = ((found.end() - time) as f32 * self.zoom).max(0.);
-        // Short clips keep a middle to grab: the grips never cover it all.
-        let grip = TRIM_GRIP.min(found.length as f32 * self.zoom / 3.);
-        let mode = if from_start < grip {
-            DragMode::TrimStart
-        } else if from_end < grip {
-            DragMode::TrimEnd
-        } else {
-            DragMode::Move
+        let stretch = self.stretch != other_mode;
+        let mode = match (grip, stretch) {
+            (Grip::Body, _) => DragMode::Move,
+            (Grip::Start, false) => DragMode::TrimStart,
+            (Grip::End, false) => DragMode::TrimEnd,
+            (Grip::Start, true) => DragMode::StretchStart,
+            (Grip::End, true) => DragMode::StretchEnd,
         };
+        let (time, _) = self.locate(position);
         self.drag = Some(ClipDrag {
             clip,
             mode,
             grabbed_at: time,
-            original: ClipPlacement {
-                lane: found.lane,
-                start: found.start,
-                offset: found.offset,
-                length: found.length,
-            },
+            original: found.placement(),
         });
         self.selected = Some(clip);
         let track = found.track.id;
@@ -466,56 +505,39 @@ impl FlowView {
             return;
         };
         let (time, lane) = self.locate(position);
+        let (clip_id, mode, original) = (drag.clip, drag.mode, drag.original);
         let delta = time - drag.grabbed_at;
-        let original = drag.original;
-        let (clip_id, mode) = (drag.clip, drag.mode);
-        let snap_reach = (SNAP_PIXELS / self.zoom) as f64;
-        // Edges of the other clips, for a moved clip to snap against.
-        let edges: Vec<f64> = self
-            .clips
-            .iter()
-            .filter(|clip| clip.id != clip_id)
-            .flat_map(|clip| [clip.start, clip.end()])
+        let original_end = original.start + original.length / original.speed;
+        let others = || self.clips.iter().filter(|clip| clip.id != clip_id);
+        let edges: Vec<f64> = others().flat_map(|clip| [clip.start, clip.end()]).collect();
+        let neighbour_bpms: Vec<f64> = others()
+            .filter(|clip| clip.start < original_end && clip.end() > original.start)
+            .filter_map(FlowClip::bpm)
             .collect();
-        let Some(clip) = self.clips.iter_mut().find(|clip| clip.id == clip_id) else {
+        let Some(clip) = self.clips.iter().find(|clip| clip.id == clip_id) else {
             return;
         };
-        let track_seconds = clip.track.duration_seconds;
-        // Trimmed ends land on a cue point if one is close, else on a bar.
-        let (grid, cues) = (clip.grid, clip.cues.clone());
-        let snap = |seconds: f64| snap_in_track(seconds, grid, &cues, snap_reach);
-        match mode {
-            DragMode::Move => {
-                let mut start = (original.start + delta).max(0.);
-                let nearest = edges
-                    .iter()
-                    .flat_map(|edge| [*edge - start, *edge - (start + original.length)])
-                    .min_by(|a, b| a.abs().total_cmp(&b.abs()));
-                if let Some(shift) = nearest.filter(|shift| shift.abs() <= snap_reach) {
-                    start = (start + shift).max(0.);
-                }
-                clip.start = start;
-                clip.lane = lane;
-            }
-            // Trimming moves one end of the clip; the other stays put on
-            // the timeline.
-            DragMode::TrimStart => {
-                let end_in_track = original.offset + original.length;
-                let offset = snap(original.offset + delta)
-                    .clamp(0., (end_in_track - MIN_CLIP_SECONDS).max(0.))
-                    // The clip cannot start before the timeline does.
-                    .max(original.offset - original.start);
-                clip.offset = offset;
-                clip.start = original.start + (offset - original.offset);
-                clip.length = end_in_track - offset;
-            }
-            DragMode::TrimEnd => {
-                let end_in_track = snap(original.offset + original.length + delta).clamp(
-                    original.offset + MIN_CLIP_SECONDS,
-                    track_seconds.max(original.offset),
-                );
-                clip.length = end_in_track - original.offset;
-            }
+        let placement = dragged_placement(
+            mode,
+            original,
+            delta,
+            lane,
+            &DragContext {
+                track_seconds: clip.track.duration_seconds,
+                grid: clip.grid,
+                cues: &clip.cues,
+                bpm: clip.track.bpm,
+                edges: &edges,
+                neighbour_bpms: &neighbour_bpms,
+                reach: (SNAP_PIXELS / self.zoom) as f64,
+            },
+        );
+        if let Some(clip) = self.clips.iter_mut().find(|clip| clip.id == clip_id) {
+            clip.lane = placement.lane;
+            clip.start = placement.start;
+            clip.offset = placement.offset;
+            clip.length = placement.length;
+            clip.speed = placement.speed;
         }
         cx.notify();
     }
@@ -528,12 +550,7 @@ impl FlowView {
             .clips
             .iter()
             .find(|clip| clip.id == drag.clip)
-            .map(|clip| ClipPlacement {
-                lane: clip.lane,
-                start: clip.start,
-                offset: clip.offset,
-                length: clip.length,
-            });
+            .map(FlowClip::placement);
         if let Some(placement) = placement.filter(|placement| *placement != drag.original) {
             self.change(cx, |library| library.place_clip(drag.clip, placement));
         } else {
@@ -602,6 +619,22 @@ impl FlowView {
             )))
             .child(div().flex_1())
             .child(
+                Button::new("stretch-mode")
+                    .outline()
+                    .small()
+                    .icon(IconName::StretchHorizontal)
+                    .label("Stretch")
+                    .tooltip(
+                        "On: dragging a block's edge changes its tempo. Off: it cuts the track. \
+                         Hold Alt while dragging for the other one. (Shift+M)",
+                    )
+                    .selected(self.stretch)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.stretch = !this.stretch;
+                        cx.notify();
+                    })),
+            )
+            .child(
                 Button::new("remove-clip")
                     .outline()
                     .small()
@@ -653,6 +686,133 @@ impl FlowView {
                         cx.notify();
                     })),
             )
+    }
+
+    /// The block the player's track was picked from, if it is still the
+    /// selected one. Key changes made in the player apply to it.
+    fn playing_clip(&self) -> Option<&FlowClip> {
+        let track = self.playing.as_ref()?.id;
+        self.clips
+            .iter()
+            .find(|clip| Some(clip.id) == self.selected && clip.track.id == track)
+    }
+
+    /// The player's key. Clicking it opens a panel with the key on the
+    /// Camelot wheel and buttons either side to shift it by a semitone.
+    fn key_chip(&self, track: &Track, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (border, muted, background, tile) = (
+            theme.border,
+            theme.muted_foreground,
+            theme.background,
+            theme.secondary,
+        );
+        let clip = self.playing_clip();
+        let shift = clip.map_or(0, |clip| clip.key_shift);
+        let clip_id = clip.map(|clip| clip.id);
+        let key = track.camelot.map(|key| key.shifted(shift));
+        let label = match (key, shift) {
+            (None, _) => "—".to_string(),
+            (Some(key), 0) => key.to_string(),
+            (Some(key), shift) => format!("{key} ({shift:+})"),
+        };
+        let step = |id: &'static str, icon: IconName, by: i32, tooltip: &'static str| {
+            Button::new(id)
+                .outline()
+                .icon(icon)
+                .tooltip(tooltip)
+                .disabled(clip_id.is_none() || key.is_none())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(clip) = clip_id {
+                        this.change(cx, |library| library.set_clip_key_shift(clip, shift + by));
+                    }
+                }))
+        };
+        let note = match (clip_id, key, shift) {
+            (_, None, _) => "This track's key is not known.".to_string(),
+            (None, ..) => "Select a block to shift its key.".to_string(),
+            (Some(_), _, 0) => "The track's own key.".to_string(),
+            (Some(_), _, 1) => "Up 1 semitone.".to_string(),
+            (Some(_), _, -1) => "Down 1 semitone.".to_string(),
+            (Some(_), _, shift) if shift > 0 => format!("Up {shift} semitones."),
+            (Some(_), _, shift) => format!("Down {} semitones.", -shift),
+        };
+
+        div()
+            .relative()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(div().text_xs().text_color(muted).child("KEY"))
+            .child(
+                div()
+                    .id("player-key")
+                    .px_2()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(border)
+                    .text_sm()
+                    .when_some(key, |this, key| {
+                        this.bg(key_colour(key, 0.85)).text_color(gpui_kit::white())
+                    })
+                    .hover(|style| style.border_color(muted))
+                    .child(label)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        // A click here while the panel is open has already
+                        // closed it, as a click outside; do not reopen it.
+                        let just_dismissed = this
+                            .key_dismissed
+                            .take()
+                            .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
+                        this.key_open = !just_dismissed;
+                        cx.notify();
+                    })),
+            )
+            .when(self.key_open, |this| {
+                // Painted last, so it floats over the timeline.
+                this.child(deferred(
+                    div()
+                        .id("key-panel")
+                        .absolute()
+                        // Upwards: there is more room above the player.
+                        .bottom(px(30.))
+                        .left_0()
+                        .occlude()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_2()
+                        .p_3()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(border)
+                        .bg(background)
+                        .shadow_lg()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .child(step("key-down", IconName::Minus, -1, "Down a semitone"))
+                                .child(wheel_display(key, muted))
+                                .child(step("key-up", IconName::Plus, 1, "Up a semitone")),
+                        )
+                        .child(
+                            div()
+                                .px_2()
+                                .rounded_sm()
+                                .bg(tile)
+                                .text_xs()
+                                .text_color(muted)
+                                .child(note),
+                        )
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.key_open = false;
+                            this.key_dismissed = Some(Instant::now());
+                            cx.notify();
+                        })),
+                ))
+            })
     }
 
     /// The player: one track's whole waveform with its cue points flagged,
@@ -813,10 +973,7 @@ impl FlowView {
                                 artist => format!("{artist} - {}", track.title),
                             }),
                     )
-                    .child(chip(
-                        "KEY",
-                        track.camelot.map_or_else(unknown, |key| key.to_string()),
-                    ))
+                    .child(self.key_chip(track, cx))
                     .child(chip(
                         "ENERGY",
                         track
@@ -949,14 +1106,14 @@ impl FlowView {
                 })
                 .max_by(|a, b| a.start.total_cmp(&b.start))?;
 
-            let tempo = match (outgoing.track.bpm, incoming.track.bpm) {
+            let tempo = match (outgoing.bpm(), incoming.bpm()) {
                 (Some(from), Some(to)) => {
                     let change = (to / from - 1.) * 100.;
                     Some((format!("{change:+.1}% BPM"), change.abs() <= 6.))
                 }
                 _ => None,
             };
-            let keys = match (outgoing.track.camelot, incoming.track.camelot) {
+            let keys = match (outgoing.camelot(), incoming.camelot()) {
                 (Some(from), Some(to)) => {
                     let mixes = from.compatible().contains(&to);
                     Some((format!("{from} → {to}"), mixes))
@@ -964,7 +1121,10 @@ impl FlowView {
                 _ => None,
             };
             // Energy of each track at the moment the new one comes in.
-            let leaving = energy_at(outgoing, outgoing.offset + incoming.start - outgoing.start);
+            let leaving = energy_at(
+                outgoing,
+                outgoing.offset + (incoming.start - outgoing.start) * outgoing.speed,
+            );
             let arriving = energy_at(incoming, incoming.offset);
             let energy = match (leaving, arriving) {
                 (Some(from), Some(to)) => Some(format!("energy {from} → {to}")),
@@ -1000,7 +1160,9 @@ impl FlowView {
     /// whose brightness follows the energy of each section.
     fn cue_marks(&self, clip: &FlowClip) -> Vec<Div> {
         let visible = |seconds: f64| seconds >= clip.offset && seconds < clip.offset + clip.length;
-        let x = |seconds: f64| px(((seconds - clip.offset) as f32 * self.zoom).max(0.));
+        // Track time to pixels along the block, which a stretch rescales.
+        let x =
+            |seconds: f64| px((((seconds - clip.offset) / clip.speed) as f32 * self.zoom).max(0.));
         let mut marks = Vec::new();
         for (index, cue) in clip.cues.iter().enumerate() {
             // The section runs to the next cue, or the end of the track.
@@ -1018,7 +1180,7 @@ impl FlowView {
                         .absolute()
                         .left(x(from))
                         .bottom_0()
-                        .w(px((to - from) as f32 * self.zoom))
+                        .w(px(((to - from) / clip.speed) as f32 * self.zoom))
                         .h(px(4.))
                         .bg(gpui_kit::white().opacity(cue.energy as f32 / 10. * 0.75)),
                 );
@@ -1046,54 +1208,119 @@ impl FlowView {
         let theme = cx.theme();
         let id = clip.id;
         let selected = self.selected == Some(id);
-        let colour = match clip.track.camelot {
+        let stretching = self.stretch;
+        let colour = match clip.camelot() {
             Some(key) => key_colour(key, 0.85),
             None => theme.secondary,
         };
+        let tempo = clip.bpm().map(|bpm| {
+            if (clip.speed - 1.).abs() < 0.0005 {
+                format!("{bpm:.0} BPM")
+            } else {
+                format!("{bpm:.0} BPM ({:+.1}%)", (clip.speed - 1.) * 100.)
+            }
+        });
         let detail = [
-            clip.track.bpm.map(|bpm| format!("{bpm:.0} BPM")),
-            clip.track.camelot.map(|key| key.to_string()),
+            tempo,
+            clip.camelot().map(|key| match clip.key_shift {
+                0 => key.to_string(),
+                shift => format!("{key} ({shift:+})"),
+            }),
             clip.track.energy.map(|energy| format!("energy {energy}")),
-            Some(clock(clip.length)),
+            Some(clock(clip.duration())),
         ]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()
         .join(" · ");
+
+        // The grab area on one end of the block. It reaches a little past
+        // the block's edge, so the edge itself is easy to catch.
+        let handle = |grip: Grip| {
+            let name = if grip == Grip::Start {
+                "clip-start"
+            } else {
+                "clip-end"
+            };
+            div()
+                .id((name, id as usize))
+                .absolute()
+                .top_0()
+                .h_full()
+                .w(px(HANDLE_WIDTH))
+                .map(|this| match grip {
+                    Grip::Start => this.left(px(-HANDLE_WIDTH / 3.)),
+                    _ => this.right(px(-HANDLE_WIDTH / 3.)),
+                })
+                .map(|this| {
+                    if stretching {
+                        this.cursor_ew_resize()
+                    } else {
+                        this.cursor_col_resize()
+                    }
+                })
+                .flex()
+                .justify_center()
+                .py_2()
+                .child(
+                    div()
+                        .w(px(3.))
+                        .h_full()
+                        .rounded_full()
+                        .bg(gpui_kit::white().opacity(if selected { 0.7 } else { 0.3 })),
+                )
+                .hover(|style| style.bg(gpui_kit::white().opacity(0.25)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        window.focus(&this.focus, cx);
+                        this.begin_drag(id, grip, event.modifiers.alt, event.position, cx);
+                    }),
+                )
+        };
+
         div()
             .id(("clip", id as usize))
             .absolute()
             .left(px(clip.start as f32 * self.zoom))
             .top(px(clip.lane as f32 * LANE_HEIGHT + 3.))
-            .w(px((clip.length as f32 * self.zoom).max(2.)))
+            .w(px((clip.duration() as f32 * self.zoom).max(2.)))
             .h(px(LANE_HEIGHT - 6.))
-            .flex()
-            .flex_col()
-            .justify_center()
-            .px_2()
-            .rounded_md()
-            .overflow_hidden()
-            .bg(colour)
-            .border_2()
-            .border_color(if selected { theme.foreground } else { colour })
-            .text_color(gpui_kit::white())
             .child(
                 div()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .truncate()
-                    .child(clip.track.title.clone()),
+                    .relative()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .px_3()
+                    .rounded_md()
+                    .overflow_hidden()
+                    .bg(colour)
+                    .border_2()
+                    .border_color(if selected { theme.foreground } else { colour })
+                    .text_color(gpui_kit::white())
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .truncate()
+                            .child(clip.track.title.clone()),
+                    )
+                    .child(div().text_xs().truncate().child(detail))
+                    .children(self.cue_marks(clip)),
             )
-            .child(div().text_xs().truncate().child(detail))
-            .children(self.cue_marks(clip))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     cx.stop_propagation();
                     window.focus(&this.focus, cx);
-                    this.begin_drag(id, event.position, cx);
+                    this.begin_drag(id, Grip::Body, false, event.position, cx);
                 }),
             )
+            .child(handle(Grip::Start))
+            .child(handle(Grip::End))
     }
 
     fn timeline(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1141,6 +1368,9 @@ impl FlowView {
                 let key = event.keystroke.key.as_str();
                 if let ("backspace" | "delete", Some(clip)) = (key, this.selected) {
                     this.change(cx, |library| library.remove_clip(clip));
+                } else if key == "m" && event.keystroke.modifiers.shift {
+                    this.stretch = !this.stretch;
+                    cx.notify();
                 }
             }))
             .overflow_x_scroll()
@@ -1182,6 +1412,99 @@ impl FlowView {
                     .child(lanes),
             )
     }
+}
+
+/// Where a held clip should be, `delta` seconds of timeline from where it
+/// was grabbed.
+fn dragged_placement(
+    mode: DragMode,
+    original: ClipPlacement,
+    delta: f64,
+    lane: usize,
+    context: &DragContext,
+) -> ClipPlacement {
+    let duration = original.length / original.speed;
+    let end = original.start + duration;
+    // Where a cut should land in the track: on a cue point if one is close,
+    // otherwise on a bar. `reach` is in timeline seconds.
+    let snap = |seconds: f64| {
+        snap_in_track(
+            seconds,
+            context.grid,
+            context.cues,
+            context.reach * original.speed,
+        )
+    };
+    let mut placement = original;
+    match mode {
+        DragMode::Move => {
+            let mut start = (original.start + delta).max(0.);
+            // Butt up against another clip's edge when close to one.
+            let nearest = context
+                .edges
+                .iter()
+                .flat_map(|edge| [*edge - start, *edge - (start + duration)])
+                .min_by(|a, b| a.abs().total_cmp(&b.abs()));
+            if let Some(shift) = nearest.filter(|shift| shift.abs() <= context.reach) {
+                start = (start + shift).max(0.);
+            }
+            placement.start = start;
+            placement.lane = lane;
+        }
+        // Cutting moves one end through the track; the other end stays
+        // where it is on the timeline.
+        DragMode::TrimStart => {
+            let end_in_track = original.offset + original.length;
+            let offset = snap(original.offset + delta * original.speed)
+                .clamp(0., (end_in_track - MIN_CLIP_SECONDS).max(0.))
+                // The clip cannot start before the timeline does.
+                .max(original.offset - original.start * original.speed);
+            placement.offset = offset;
+            placement.start = original.start + (offset - original.offset) / original.speed;
+            placement.length = end_in_track - offset;
+        }
+        DragMode::TrimEnd => {
+            let end_in_track = snap(original.offset + original.length + delta * original.speed)
+                .clamp(
+                    original.offset + MIN_CLIP_SECONDS,
+                    context
+                        .track_seconds
+                        .max(original.offset + MIN_CLIP_SECONDS),
+                );
+            placement.length = end_in_track - original.offset;
+        }
+        // Stretching keeps the same music and changes how long it takes.
+        DragMode::StretchEnd => {
+            placement.speed = snap_speed(original.length / (duration + delta).max(0.01), context);
+        }
+        DragMode::StretchStart => {
+            let speed = snap_speed(original.length / (duration - delta).max(0.01), context);
+            placement.speed = speed;
+            placement.start = (end - original.length / speed).max(0.);
+        }
+    }
+    placement
+}
+
+/// The speed a stretch should settle on: the tempo of an overlapping clip
+/// if it is close to one, otherwise a whole number of BPM. A track with no
+/// known tempo moves in steps of half a percent.
+fn snap_speed(speed: f64, context: &DragContext) -> f64 {
+    let speed = speed.clamp(MIN_CLIP_SPEED, MAX_CLIP_SPEED);
+    let snapped = match context.bpm {
+        Some(bpm) => {
+            let tempo = speed * bpm;
+            let neighbour = context
+                .neighbour_bpms
+                .iter()
+                .copied()
+                .filter(|other| (other - tempo).abs() <= TEMPO_MAGNET_BPM)
+                .min_by(|a, b| (a - tempo).abs().total_cmp(&(b - tempo).abs()));
+            neighbour.unwrap_or_else(|| tempo.round()) / bpm
+        }
+        None => (speed * 200.).round() / 200.,
+    };
+    snapped.clamp(MIN_CLIP_SPEED, MAX_CLIP_SPEED)
 }
 
 /// The length of one bar, taking four beats to the bar.
@@ -1316,9 +1639,9 @@ fn overview(
 #[cfg(test)]
 mod tests {
     // Not `super::*`: that would bring in GPUI's own `test` attribute.
-    use super::{clock, snap_in_track, snap_to_bar};
-    use djcraft_library::CuePoint;
+    use super::{DragContext, DragMode, clock, dragged_placement, snap_in_track, snap_to_bar};
     use djcraft_library::TempoResult;
+    use djcraft_library::{ClipPlacement, CuePoint};
 
     #[test]
     fn positions_snap_to_bars_from_the_first_beat() {
@@ -1342,5 +1665,85 @@ mod tests {
         }];
         assert_eq!(snap_in_track(3.0, grid, &cues, 0.5), 3.2);
         assert_eq!(snap_in_track(3.0, grid, &cues, 0.1), 2.5);
+    }
+
+    /// A four-minute clip of a 120 BPM track, placed one minute in.
+    fn clip() -> ClipPlacement {
+        ClipPlacement {
+            lane: 0,
+            start: 60.,
+            offset: 0.,
+            length: 240.,
+            speed: 1.,
+        }
+    }
+
+    fn context<'a>(edges: &'a [f64], neighbour_bpms: &'a [f64]) -> DragContext<'a> {
+        DragContext {
+            track_seconds: 240.,
+            grid: Some(TempoResult {
+                bpm: 120.,
+                first_beat_seconds: 0.,
+                confidence: 1.,
+            }),
+            cues: &[],
+            bpm: Some(120.),
+            edges,
+            neighbour_bpms,
+            reach: 1.,
+        }
+    }
+
+    #[test]
+    fn dragging_an_edge_cuts_the_track() {
+        let none = context(&[], &[]);
+        // Left edge dragged 8.6 s right: the clip starts later, and further
+        // into the track, on a bar line (bars are 2 s at 120 BPM).
+        let cut = dragged_placement(DragMode::TrimStart, clip(), 8.6, 0, &none);
+        assert_eq!(
+            (cut.start, cut.offset, cut.length, cut.speed),
+            (68., 8., 232., 1.)
+        );
+        // Right edge dragged 31 s left: it ends earlier; the start stays.
+        let cut = dragged_placement(DragMode::TrimEnd, clip(), -31., 0, &none);
+        assert_eq!((cut.start, cut.offset, cut.length), (60., 0., 210.));
+        // Neither edge can go past the ends of the track.
+        let cut = dragged_placement(DragMode::TrimStart, clip(), -50., 0, &none);
+        assert_eq!((cut.start, cut.offset, cut.length), (60., 0., 240.));
+        let cut = dragged_placement(DragMode::TrimEnd, clip(), 50., 0, &none);
+        assert_eq!(cut.length, 240.);
+    }
+
+    #[test]
+    fn stretching_an_edge_changes_the_tempo() {
+        let none = context(&[], &[]);
+        // Right edge pulled in by about 4 s: the same music in less time is
+        // faster, settling on a whole BPM (122), and the start does not move.
+        let fast = dragged_placement(DragMode::StretchEnd, clip(), -4., 0, &none);
+        assert!((fast.speed * 120. - 122.).abs() < 1e-9);
+        assert_eq!((fast.start, fast.offset, fast.length), (60., 0., 240.));
+        // Left edge pulled out: slower, and the end stays where it was.
+        let slow = dragged_placement(DragMode::StretchStart, clip(), -10., 0, &none);
+        assert!((slow.speed * 120. - 115.).abs() < 1e-9);
+        assert!((slow.start + slow.length / slow.speed - 300.).abs() < 1e-9);
+
+        // Close to an overlapping clip's tempo, it locks onto it exactly.
+        let beside = context(&[], &[121.5]);
+        let matched = dragged_placement(DragMode::StretchEnd, clip(), -4., 0, &beside);
+        assert!((matched.speed * 120. - 121.5).abs() < 1e-9);
+
+        // A stretch cannot go beyond half or double speed.
+        let limit = dragged_placement(DragMode::StretchEnd, clip(), -239., 0, &none);
+        assert_eq!(limit.speed, 2.);
+    }
+
+    #[test]
+    fn a_moved_clip_snaps_to_other_clips() {
+        let beside = context(&[400.], &[]);
+        // Its end (start + 240) comes within reach of an edge at 400.
+        let moved = dragged_placement(DragMode::Move, clip(), 99.5, 2, &beside);
+        assert_eq!((moved.start, moved.lane), (160., 2));
+        let free = dragged_placement(DragMode::Move, clip(), 50., 1, &beside);
+        assert_eq!(free.start, 110.);
     }
 }

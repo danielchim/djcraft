@@ -336,6 +336,8 @@ fn an_existing_library_gains_playlists_on_upgrade() {
         "DROP TABLE playlist_tracks; DROP TABLE playlists;
          ALTER TABLE tracks DROP COLUMN cues_manual;
          DROP TABLE cues; ALTER TABLE tracks DROP COLUMN energy;
+         ALTER TABLE flow_clips DROP COLUMN key_shift;
+         ALTER TABLE flow_clips DROP COLUMN speed;
          DROP TABLE flow_clips; DROP TABLE flows;
          ALTER TABLE tracks DROP COLUMN tempo_bpm;
          ALTER TABLE tracks DROP COLUMN tempo_first_beat;
@@ -834,6 +836,7 @@ fn flows_place_and_trim_clips_on_lanes() {
         start: 30.0,
         offset: 2.5,
         length: 4.0,
+        speed: 1.0,
     };
     assert_eq!(placed(&library, trimmed), (2, 30.0, 2.5, 4.0));
     let too_long = ClipPlacement {
@@ -847,6 +850,42 @@ fn flows_place_and_trim_clips_on_lanes() {
         ..trimmed
     };
     assert_eq!(placed(&library, too_late), (2, 30.0, 9.0, 1.0));
+
+    // Twice as fast takes half as long on the timeline; speed has limits.
+    let stretched = |library: &Library, speed: f64| {
+        let placement = ClipPlacement {
+            offset: 2.0,
+            length: 6.0,
+            speed,
+            ..trimmed
+        };
+        library.place_clip(two, placement).unwrap();
+        let clips = library.flow_clips(flow.id).unwrap();
+        let clip = clips.into_iter().find(|c| c.id == two).unwrap();
+        (clip.speed, clip.duration(), clip.end())
+    };
+    assert_eq!(stretched(&library, 2.0), (2.0, 3.0, 33.0));
+    assert_eq!(stretched(&library, 0.75), (0.75, 8.0, 38.0));
+    assert_eq!(stretched(&library, 9.0).0, 2.0);
+    assert_eq!(stretched(&library, 0.01).0, 0.5);
+    assert_eq!(stretched(&library, f64::NAN).0, 1.0);
+
+    // A clip's key can be shifted; the track's own key is untouched.
+    let shifted = |library: &Library, semitones: i32| {
+        library.set_clip_key_shift(one, semitones).unwrap();
+        let clips = library.flow_clips(flow.id).unwrap();
+        let clip = clips.into_iter().find(|c| c.id == one).unwrap();
+        (
+            clip.key_shift,
+            clip.camelot().map(|key| key.to_string()),
+            clip.track.camelot,
+        )
+    };
+    let own = Camelot::parse("8A");
+    assert_eq!(shifted(&library, 0), (0, Some("8A".into()), own));
+    assert_eq!(shifted(&library, 1), (1, Some("3A".into()), own));
+    assert_eq!(shifted(&library, -2), (-2, Some("6A".into()), own));
+    assert_eq!(shifted(&library, 40).0, 12);
 
     library.remove_clip(one).unwrap();
     assert_eq!(library.flow_clips(flow.id).unwrap().len(), 2);

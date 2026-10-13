@@ -20,11 +20,14 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, params};
 
 pub use camelot::Camelot;
-pub use flow::{ClipPlacement, FLOW_LANES, Flow, FlowClip, MIN_CLIP_SECONDS};
+pub use flow::{
+    ClipPlacement, FLOW_LANES, Flow, FlowClip, MAX_CLIP_SPEED, MAX_KEY_SHIFT, MIN_CLIP_SECONDS,
+    MIN_CLIP_SPEED,
+};
 pub use import::{ImportSummary, ImportedPlaylist, read_playlists};
 pub use scan::{Artwork, ScanProgress, ScanSummary, TrackEdit, read_artwork};
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 8;
 
 /// A measured tempo is shown only when the analysis was at least this sure
 /// of it. Below that (mixes with several tempos, music with no clear beat)
@@ -304,6 +307,25 @@ impl Library {
                 "BEGIN;
                  ALTER TABLE tracks ADD COLUMN cues_manual INTEGER NOT NULL DEFAULT 0;
                  PRAGMA user_version = 6;
+                 COMMIT;",
+            )?;
+        }
+        if version < 7 {
+            // A clip can be stretched: played faster or slower than its
+            // track, to bring it to another tempo.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE flow_clips ADD COLUMN speed REAL NOT NULL DEFAULT 1.0;
+                 PRAGMA user_version = 7;
+                 COMMIT;",
+            )?;
+        }
+        if version < 8 {
+            // A clip's key can be shifted up or down by semitones.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE flow_clips ADD COLUMN key_shift INTEGER NOT NULL DEFAULT 0;
+                 PRAGMA user_version = 8;
                  COMMIT;",
             )?;
         }

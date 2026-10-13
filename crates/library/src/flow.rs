@@ -6,12 +6,17 @@
 
 use rusqlite::{OptionalExtension, params};
 
-use crate::{CuePoint, Error, Library, Result, TempoResult, Track, TrackQuery};
+use crate::{Camelot, CuePoint, Error, Library, Result, TempoResult, Track, TrackQuery};
 
 /// As many lanes as there are decks to play them on.
 pub const FLOW_LANES: usize = 4;
 /// The shortest a clip can be trimmed to, in seconds.
 pub const MIN_CLIP_SECONDS: f64 = 1.0;
+/// How far a clip may be slowed down or sped up.
+pub const MIN_CLIP_SPEED: f64 = 0.5;
+pub const MAX_CLIP_SPEED: f64 = 2.0;
+/// How far a clip's key may be shifted either way, in semitones.
+pub const MAX_KEY_SHIFT: i32 = 12;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Flow {
@@ -30,8 +35,13 @@ pub struct FlowClip {
     pub start: f64,
     /// Where in the track the clip begins, in seconds.
     pub offset: f64,
-    /// How long the clip plays for, in seconds.
+    /// How much of the track the clip uses, in seconds of the track.
     pub length: f64,
+    /// How fast the clip plays: 1.0 is the track's own tempo, 1.05 is 5%
+    /// faster. A faster clip takes up less of the timeline.
+    pub speed: f64,
+    /// How many semitones the clip is shifted up (or, if negative, down).
+    pub key_shift: i32,
     pub track: Track,
     /// The track's measured beat grid, for snapping to bars.
     pub grid: Option<TempoResult>,
@@ -40,8 +50,33 @@ pub struct FlowClip {
 }
 
 impl FlowClip {
+    /// How long the clip lasts on the timeline, in seconds.
+    pub fn duration(&self) -> f64 {
+        self.length / self.speed
+    }
+
     pub fn end(&self) -> f64 {
-        self.start + self.length
+        self.start + self.duration()
+    }
+
+    /// The clip's tempo as played: the track's tempo times the clip's speed.
+    pub fn bpm(&self) -> Option<f64> {
+        self.track.bpm.map(|bpm| bpm * self.speed)
+    }
+
+    /// The clip's key as played: the track's key, shifted.
+    pub fn camelot(&self) -> Option<Camelot> {
+        self.track.camelot.map(|key| key.shifted(self.key_shift))
+    }
+
+    pub fn placement(&self) -> ClipPlacement {
+        ClipPlacement {
+            lane: self.lane,
+            start: self.start,
+            offset: self.offset,
+            length: self.length,
+            speed: self.speed,
+        }
     }
 }
 
@@ -52,6 +87,7 @@ pub struct ClipPlacement {
     pub start: f64,
     pub offset: f64,
     pub length: f64,
+    pub speed: f64,
 }
 
 impl ClipPlacement {
@@ -63,6 +99,11 @@ impl ClipPlacement {
         Self {
             lane: self.lane.min(FLOW_LANES - 1),
             start: self.start.max(0.0),
+            speed: if self.speed.is_finite() {
+                self.speed.clamp(MIN_CLIP_SPEED, MAX_CLIP_SPEED)
+            } else {
+                1.0
+            },
             offset,
             length: self.length.clamp(
                 MIN_CLIP_SECONDS.min(track_seconds),
@@ -123,7 +164,7 @@ impl Library {
     /// A flow's clips, in the order they start.
     pub fn flow_clips(&self, flow: i64) -> Result<Vec<FlowClip>> {
         let mut statement = self.conn.prepare(
-            "SELECT id, track_id, lane, start, offset, length FROM flow_clips
+            "SELECT id, track_id, lane, start, offset, length, speed, key_shift FROM flow_clips
              WHERE flow_id = ?1 ORDER BY start, lane, id",
         )?;
         let rows = statement
@@ -135,12 +176,14 @@ impl Library {
                     row.get::<_, f64>(3)?,
                     row.get::<_, f64>(4)?,
                     row.get::<_, f64>(5)?,
+                    row.get::<_, f64>(6)?,
+                    row.get::<_, i32>(7)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let mut clips = Vec::with_capacity(rows.len());
-        for (id, track_id, lane, start, offset, length) in rows {
+        for (id, track_id, lane, start, offset, length, speed, key_shift) in rows {
             let Some(track) = self.track(track_id)? else {
                 continue;
             };
@@ -150,6 +193,8 @@ impl Library {
                 start,
                 offset,
                 length,
+                speed,
+                key_shift,
                 grid: self.beat_grid(track_id)?,
                 cues: self.cues(track_id)?,
                 track,
@@ -178,6 +223,7 @@ impl Library {
             start,
             offset: 0.0,
             length: track.duration_seconds,
+            speed: 1.0,
         }
         .fitted(track.duration_seconds);
         self.conn.execute(
@@ -212,14 +258,25 @@ impl Library {
         };
         let placement = placement.fitted(track_seconds);
         self.conn.execute(
-            "UPDATE flow_clips SET lane = ?2, start = ?3, offset = ?4, length = ?5 WHERE id = ?1",
+            "UPDATE flow_clips SET lane = ?2, start = ?3, offset = ?4, length = ?5, speed = ?6
+             WHERE id = ?1",
             params![
                 clip,
                 placement.lane as i64,
                 placement.start,
                 placement.offset,
-                placement.length
+                placement.length,
+                placement.speed
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Shifts a clip's key by a number of semitones from the track's own.
+    pub fn set_clip_key_shift(&self, clip: i64, semitones: i32) -> Result<()> {
+        self.conn.execute(
+            "UPDATE flow_clips SET key_shift = ?2 WHERE id = ?1",
+            params![clip, semitones.clamp(-MAX_KEY_SHIFT, MAX_KEY_SHIFT)],
         )?;
         Ok(())
     }

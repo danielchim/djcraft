@@ -186,6 +186,118 @@ impl Render for DraggedTrack {
     }
 }
 
+const WHEEL_SIZE: f32 = 204.;
+const WHEEL_LABEL: f32 = 24.;
+/// Inner and outer edge of each ring of the wheel.
+const WHEEL_MINOR: (f32, f32) = (44., 71.);
+const WHEEL_MAJOR: (f32, f32) = (73., 100.);
+
+/// Where a key sits round the wheel: twelve o'clock is 12, and each number
+/// is a twelfth of a turn on.
+fn wheel_angle(key: Camelot) -> f32 {
+    (key.number % 12) as f32 * (TAU / 12.) - TAU / 4.
+}
+
+/// The top-left corner of a key's label, within the wheel.
+fn wheel_label_corner(key: Camelot) -> (Pixels, Pixels) {
+    let (inner, outer) = if key.major { WHEEL_MAJOR } else { WHEEL_MINOR };
+    let radius = (inner + outer) / 2.;
+    let angle = wheel_angle(key);
+    (
+        px(WHEEL_SIZE / 2. + radius * angle.cos() - WHEEL_LABEL / 2.),
+        px(WHEEL_SIZE / 2. + radius * angle.sin() - WHEEL_LABEL / 2.),
+    )
+}
+
+/// The wheel's 24 coloured segments. With a key lit, it and the keys that
+/// mix with it stand out and the rest are dimmed.
+fn wheel_segments(lit: Option<[Camelot; 4]>) -> impl IntoElement {
+    let strength = move |key: Camelot| match lit {
+        None => 0.85,
+        Some(lit) if lit[0] == key => 1.,
+        Some(lit) if lit.contains(&key) => 0.8,
+        Some(_) => 0.18,
+    };
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let centre = bounds.origin + point(px(WHEEL_SIZE / 2.), px(WHEEL_SIZE / 2.));
+            let at = |radius: f32, angle: f32| {
+                centre + point(px(radius * angle.cos()), px(radius * angle.sin()))
+            };
+            for key in Camelot::all() {
+                let (inner, outer) = if key.major { WHEEL_MAJOR } else { WHEEL_MINOR };
+                // A sliver is left between neighbours.
+                let (from, to) = (
+                    wheel_angle(key) - TAU / 24. + 0.02,
+                    wheel_angle(key) + TAU / 24. - 0.02,
+                );
+                let steps = 8;
+                let sweep = |step: usize| from + (to - from) * step as f32 / steps as f32;
+                let mut path = PathBuilder::fill();
+                path.move_to(at(outer, from));
+                for step in 1..=steps {
+                    path.line_to(at(outer, sweep(step)));
+                }
+                for step in (0..=steps).rev() {
+                    path.line_to(at(inner, sweep(step)));
+                }
+                path.close();
+                if let Ok(path) = path.build() {
+                    window.paint_path(path, key_colour(key, strength(key)));
+                }
+            }
+        },
+    )
+    .absolute()
+    .size_full()
+}
+
+/// A Camelot wheel that only shows a key: it and the keys that mix with it
+/// are lit, and its name is in the middle.
+pub fn wheel_display(key: Option<Camelot>, muted: Hsla) -> Div {
+    let lit = key.map(|key| key.compatible());
+    let labels = Camelot::all().map(|label| {
+        let (left, top) = wheel_label_corner(label);
+        let dimmed = lit.is_some_and(|lit| !lit.contains(&label));
+        div()
+            .absolute()
+            .left(left)
+            .top(top)
+            .size(px(WHEEL_LABEL))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(10.))
+            .font_weight(FontWeight::BOLD)
+            .text_color(gpui_kit::white().opacity(if dimmed { 0.45 } else { 1. }))
+            .child(label.to_string())
+    });
+    let hub = div()
+        .absolute()
+        .left(px(WHEEL_SIZE / 2. - 40.))
+        .top(px(WHEEL_SIZE / 2. - 20.))
+        .w(px(80.))
+        .h(px(40.))
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .map(|this| match key {
+            Some(key) => this
+                .child(div().font_weight(FontWeight::BOLD).child(key.to_string()))
+                .child(div().text_size(px(10.)).text_color(muted).child(key.name())),
+            None => this.child(div().text_xs().text_color(muted).child("No key")),
+        });
+    div()
+        .relative()
+        .flex_none()
+        .size(px(WHEEL_SIZE))
+        .child(wheel_segments(lit))
+        .children(labels)
+        .child(hub)
+}
+
 /// The colour that stands for a key: hue by its number round the wheel,
 /// darker for minor keys.
 pub fn key_colour(key: Camelot, strength: f32) -> Hsla {
@@ -1123,7 +1235,6 @@ impl LibraryView {
     /// Gives a compact browser a button that pops up the Camelot wheel.
     pub fn show_wheel(&mut self, cx: &mut Context<Self>) {
         self.wheel_in_browser = true;
-        self.wheel_open = true;
         cx.notify();
     }
 
@@ -1766,65 +1877,23 @@ impl LibraryView {
     /// Picking a key lights up the keys that mix with it and narrows the
     /// track list to them.
     fn wheel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        const SIZE: f32 = 204.;
-        const LABEL: f32 = 24.;
-        // Inner and outer edge of each ring.
-        const MINOR: (f32, f32) = (44., 71.);
-        const MAJOR: (f32, f32) = (73., 100.);
+        const SIZE: f32 = WHEEL_SIZE;
+        const LABEL: f32 = WHEEL_LABEL;
 
         let muted = cx.theme().muted_foreground;
         let picked = self.wheel_key;
         let lit = picked.map(|key| key.compatible());
-        // Twelve o'clock is 12; each number is a twelfth of a turn on.
-        let angle = |key: Camelot| (key.number % 12) as f32 * (TAU / 12.) - TAU / 4.;
-        let strength = move |key: Camelot| match lit {
-            None => 0.85,
-            Some(lit) if lit[0] == key => 1.,
-            Some(lit) if lit.contains(&key) => 0.8,
-            Some(_) => 0.18,
-        };
-
-        let segments = canvas(
-            |_, _, _| (),
-            move |bounds, _, window, _| {
-                let centre = bounds.origin + point(px(SIZE / 2.), px(SIZE / 2.));
-                let at = |radius: f32, angle: f32| {
-                    centre + point(px(radius * angle.cos()), px(radius * angle.sin()))
-                };
-                for key in Camelot::all() {
-                    let (inner, outer) = if key.major { MAJOR } else { MINOR };
-                    // A sliver is left between neighbours.
-                    let (from, to) = (angle(key) - TAU / 24. + 0.02, angle(key) + TAU / 24. - 0.02);
-                    let steps = 8;
-                    let sweep = |step: usize| from + (to - from) * step as f32 / steps as f32;
-                    let mut path = PathBuilder::fill();
-                    path.move_to(at(outer, from));
-                    for step in 1..=steps {
-                        path.line_to(at(outer, sweep(step)));
-                    }
-                    for step in (0..=steps).rev() {
-                        path.line_to(at(inner, sweep(step)));
-                    }
-                    path.close();
-                    if let Ok(path) = path.build() {
-                        window.paint_path(path, key_colour(key, strength(key)));
-                    }
-                }
-            },
-        )
-        .absolute()
-        .size_full();
+        let segments = wheel_segments(lit);
 
         let labels = Camelot::all().map(|key| {
-            let (inner, outer) = if key.major { MAJOR } else { MINOR };
-            let radius = (inner + outer) / 2.;
+            let (left, top) = wheel_label_corner(key);
             let dimmed = lit.is_some_and(|lit| !lit.contains(&key));
             let count = self.key_counts.get(&key).copied().unwrap_or(0);
             div()
                 .id(("wheel-key", key.number as usize * 2 + key.major as usize))
                 .absolute()
-                .left(px(SIZE / 2. + radius * angle(key).cos() - LABEL / 2.))
-                .top(px(SIZE / 2. + radius * angle(key).sin() - LABEL / 2.))
+                .left(left)
+                .top(top)
                 .size(px(LABEL))
                 .flex()
                 .items_center()

@@ -120,6 +120,10 @@ Feature set modelled on Mixed In Key 10.
 - [~] Waveforms and cue points on clips (cue points and energy are drawn,
       and trims snap to cue points; no waveforms)
 - [x] Delete or Backspace removes the selected clip
+- [~] Stretch a clip to another tempo by dragging its edge, with a Stretch
+      toggle (Shift+M) and Alt for the other mode; snaps to whole BPM and to
+      the tempo of overlapping clips (planning only: the key is assumed
+      locked, and nothing is heard)
 
 ### Organisation
 
@@ -197,7 +201,8 @@ Feature set modelled on Mixed In Key 10.
 - [ ] Reverse play
 - [ ] Loop move
 - [ ] 16 hot cues per deck
-- [ ] Key shift and key sync
+- [~] Key shift and key sync (a block in Flow can be shifted by semitones
+      for planning; the decks cannot shift key yet)
 
 ### Mixer
 

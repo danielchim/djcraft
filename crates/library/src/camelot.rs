@@ -92,6 +92,16 @@ impl Camelot {
         ]
     }
 
+    /// The key a number of semitones above (or, if negative, below) this
+    /// one. Each semitone is seven steps round the wheel.
+    pub fn shifted(self, semitones: i32) -> Camelot {
+        let steps = (self.number as i32 - 1 + 7 * semitones).rem_euclid(12);
+        Camelot {
+            number: steps as u8 + 1,
+            major: self.major,
+        }
+    }
+
     /// The key's usual name, such as `A minor` or `F♯ major`.
     pub fn name(self) -> String {
         const MAJORS: [&str; 12] = [
@@ -166,6 +176,20 @@ mod tests {
         }
         assert_eq!(Camelot::parse("8A").unwrap().name(), "A minor");
         assert_eq!(Camelot::parse("2B").unwrap().name(), "F♯ major");
+    }
+
+    #[test]
+    fn shifting_moves_by_semitones() {
+        let key = |text: &str| Camelot::parse(text).unwrap();
+        // A minor up a semitone is B♭ minor; down one is A♭ minor.
+        assert_eq!(key("Am").shifted(1), key("Bbm"));
+        assert_eq!(key("Am").shifted(-1), key("G#m"));
+        assert_eq!(key("C").shifted(2), key("D"));
+        assert_eq!(key("C").shifted(12), key("C"));
+        assert_eq!(key("C").shifted(-14), key("Bb"));
+        for key in Camelot::all() {
+            assert_eq!(key.shifted(5).shifted(-5), key);
+        }
     }
 
     #[test]
