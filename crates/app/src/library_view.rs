@@ -1,21 +1,25 @@
 use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::f32::consts::TAU;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use djcraft_library::lookup::{self, Provider, TrackMatch};
 use djcraft_library::{
-    ImportSummary, Library, Playlist, Source, SourceKind, Track, TrackEdit, TrackQuery,
+    Camelot, ImportSummary, Library, Playlist, Source, SourceKind, Track, TrackEdit, TrackQuery,
     read_artwork, read_playlists,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Icon, Selectable, Sizable,
+    ActiveTheme, Disableable, Icon, Selectable, Sizable, WindowExt,
     button::{Button, ButtonRounded, ButtonVariants},
     input::{Input, InputEvent, InputState},
-    menu::{PopupMenu, PopupMenuItem},
+    menu::{DropdownMenu, PopupMenu, PopupMenuItem},
+    notification::Notification,
     table::{Column, ColumnSort, DataTable, TableDelegate, TableEvent, TableState},
+    tooltip::Tooltip,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -30,7 +34,7 @@ const ANALYSIS_REFRESH: Duration = Duration::from_secs(2);
 enum Section {
     Library,
     Playlists,
-    Camelot,
+    Flow,
     History,
 }
 
@@ -38,7 +42,7 @@ impl Section {
     const ALL: [Section; 4] = [
         Section::Library,
         Section::Playlists,
-        Section::Camelot,
+        Section::Flow,
         Section::History,
     ];
 
@@ -46,7 +50,7 @@ impl Section {
         match self {
             Section::Library => (IconName::Library, "Library"),
             Section::Playlists => (IconName::ListMusic, "Playlists"),
-            Section::Camelot => (IconName::CircleDashed, "Camelot"),
+            Section::Flow => (IconName::Workflow, "Flow"),
             Section::History => (IconName::Clock, "History"),
         }
     }
@@ -55,6 +59,8 @@ impl Section {
 /// Where the tracks shown in the library come from.
 #[derive(Clone, Copy, PartialEq)]
 enum Origin {
+    /// Every source together.
+    All,
     Local,
     AppleMusic,
     Spotify,
@@ -64,10 +70,16 @@ enum Origin {
 
 impl Origin {
     /// The sources shown as tabs.
-    const ALL: [Origin; 3] = [Origin::Local, Origin::AppleMusic, Origin::Spotify];
+    const ALL: [Origin; 4] = [
+        Origin::All,
+        Origin::Local,
+        Origin::AppleMusic,
+        Origin::Spotify,
+    ];
 
     fn icon_and_label(self) -> (IconName, &'static str) {
         match self {
+            Origin::All => (IconName::Layers, "All"),
             Origin::Local => (IconName::HardDrive, "Local"),
             Origin::AppleMusic => (IconName::Music, "Apple Music"),
             Origin::Spotify => (IconName::Disc3, "Spotify"),
@@ -123,23 +135,62 @@ enum Field {
     Genre,
     Bpm,
     Key,
+    Energy,
     Time,
+    Source,
 }
 
-const COLUMNS: [(Field, &str, f32); 7] = [
+const COLUMNS: [(Field, &str, f32); 9] = [
     (Field::Title, "Title", 260.),
     (Field::Artist, "Artist", 170.),
     (Field::Album, "Album", 170.),
     (Field::Genre, "Genre", 110.),
     (Field::Bpm, "BPM", 70.),
     (Field::Key, "Key", 60.),
+    (Field::Energy, "Energy", 80.),
     (Field::Time, "Time", 70.),
+    (Field::Source, "Source", 110.),
 ];
 
 /// What the library asks the rest of the app to do.
 pub enum LibraryEvent {
-    /// Load a track onto the given deck, or onto whichever deck is free.
-    Load { path: PathBuf, deck: Option<usize> },
+    /// A track was chosen (double-clicked, or sent to a deck from its menu).
+    /// On the decks that loads it onto `deck`, or onto whichever is free.
+    Load {
+        id: i64,
+        path: PathBuf,
+        deck: Option<usize>,
+    },
+    /// A track was picked out in one of the compact browsers.
+    Selected { id: i64 },
+}
+
+/// A track being dragged out of a track list.
+#[derive(Clone)]
+pub struct DraggedTrack {
+    pub id: i64,
+    pub title: SharedString,
+}
+
+impl Render for DraggedTrack {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .bg(cx.theme().secondary)
+            .border_1()
+            .border_color(cx.theme().border)
+            .text_sm()
+            .child(self.title.clone())
+    }
+}
+
+/// The colour that stands for a key: hue by its number round the wheel,
+/// darker for minor keys.
+pub fn key_colour(key: Camelot, strength: f32) -> Hsla {
+    let lightness = if key.major { 0.52 } else { 0.38 };
+    hsla((key.number - 1) as f32 / 12., 0.62, lightness, strength)
 }
 
 struct TrackTable {
@@ -202,10 +253,19 @@ impl TrackTable {
                 Field::Album => text(&a.album, &b.album),
                 Field::Genre => text(&a.genre, &b.genre),
                 Field::Bpm => optional(a.bpm, b.bpm),
-                Field::Key => text(
-                    a.key.as_deref().unwrap_or(""),
-                    b.key.as_deref().unwrap_or(""),
-                ),
+                Field::Energy => optional(a.energy.map(f64::from), b.energy.map(f64::from)),
+                // Everything is local for now, so fall back to the folder.
+                Field::Source => text(&a.source_name, &b.source_name),
+                // Wheel order, with keys that could not be read last.
+                Field::Key => match (a.camelot, b.camelot) {
+                    (Some(a), Some(b)) => a.cmp(&b),
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => text(
+                        a.key.as_deref().unwrap_or(""),
+                        b.key.as_deref().unwrap_or(""),
+                    ),
+                },
                 Field::Time => a.duration_seconds.total_cmp(&b.duration_seconds),
             };
             let order = if descending { order.reverse() } else { order };
@@ -227,7 +287,7 @@ impl TableDelegate for TrackTable {
         let (field, name, width) = COLUMNS[col_ix];
         let column = Column::new(name, name).width(px(width)).sortable();
         match field {
-            Field::Bpm | Field::Time => column.text_right(),
+            Field::Bpm | Field::Energy | Field::Time => column.text_right(),
             _ => column,
         }
     }
@@ -300,6 +360,26 @@ impl TableDelegate for TrackTable {
         menu
     }
 
+    fn render_tr(
+        &mut self,
+        row_ix: usize,
+        _: &mut Window,
+        _: &mut Context<TableState<Self>>,
+    ) -> Stateful<Div> {
+        let row = div().id(("row", row_ix));
+        // Rows can be dragged out, onto a Flow lane for one.
+        match self.tracks.get(row_ix) {
+            Some(track) => row.on_drag(
+                DraggedTrack {
+                    id: track.id,
+                    title: track.title.clone().into(),
+                },
+                |dragged, _, _, cx| cx.new(|_| dragged.clone()),
+            ),
+            None => row,
+        }
+    }
+
     fn render_td(
         &mut self,
         row_ix: usize,
@@ -313,12 +393,25 @@ impl TableDelegate for TrackTable {
             Field::Artist => track.artist.clone().into(),
             Field::Album => track.album.clone().into(),
             Field::Genre => track.genre.clone().into(),
+            // Where the track comes from; folders and loose files are local.
+            Field::Source => match track.source_kind {
+                SourceKind::Folder | SourceKind::Files => "Local".into(),
+            },
+            Field::Energy => track
+                .energy
+                .map(|energy| energy.to_string())
+                .unwrap_or_default()
+                .into(),
             Field::Bpm => track
                 .bpm
                 .map(|bpm| format!("{bpm:.1}"))
                 .unwrap_or_default()
                 .into(),
-            Field::Key => track.key.clone().unwrap_or_default().into(),
+            // Camelot notation when the tag can be understood, else as tagged.
+            Field::Key => match track.camelot {
+                Some(key) => key.to_string().into(),
+                None => track.key.clone().unwrap_or_default().into(),
+            },
             Field::Time => {
                 let seconds = track.duration_seconds.round() as u64;
                 format!("{}:{:02}", seconds / 60, seconds % 60).into()
@@ -344,6 +437,13 @@ pub struct LibraryView {
     notice: Option<SharedString>,
     /// The small browser under the decks, not the full Library tab.
     compact: bool,
+    /// Whether a compact browser offers the Camelot wheel, from a button
+    /// beside its track count.
+    wheel_in_browser: bool,
+    /// Whether that wheel is showing.
+    wheel_open: bool,
+    /// When the wheel was last closed by a click outside it.
+    wheel_dismissed: Option<Instant>,
     section: Section,
     origin: Origin,
     sources: Vec<Source>,
@@ -367,6 +467,11 @@ pub struct LibraryView {
     editing: bool,
     running_scans: usize,
     scan_counters: Arc<ScanCounters>,
+    /// The key picked on the Camelot wheel.
+    wheel_key: Option<Camelot>,
+    key_counts: HashMap<Camelot, usize>,
+    /// The Flow editor; the compact browsers have none.
+    flow: Option<Entity<crate::flow_view::FlowView>>,
     /// Whether tracks are being analysed in the background.
     analysing: bool,
     analysis: Arc<crate::analysis::Progress>,
@@ -394,12 +499,11 @@ impl LibraryView {
         cx.subscribe_in(
             &new_playlist,
             window,
-            |this, input, event: &InputEvent, window, cx| {
+            |this, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
-                    let name = input.read(cx).value().trim().to_string();
-                    if !name.is_empty() {
-                        input.update(cx, |input, cx| input.set_value("", window, cx));
-                        this.create_playlist(&name, cx);
+                    // Enter in the New playlist dialog is the same as Create.
+                    if this.create_named_playlist(cx) {
+                        window.close_dialog(cx);
                     }
                 }
             },
@@ -416,14 +520,19 @@ impl LibraryView {
                     TableEvent::DoubleClickedRow(row) => {
                         if let Some(track) = track(row) {
                             cx.emit(LibraryEvent::Load {
+                                id: track.id,
                                 path: track.path,
                                 deck: None,
                             });
                         }
                     }
-                    TableEvent::SelectRow(row) if !this.compact => {
+                    TableEvent::SelectRow(row) => {
                         if let Some(track) = track(row) {
-                            this.inspect(track, window, cx);
+                            if this.compact {
+                                cx.emit(LibraryEvent::Selected { id: track.id });
+                            } else {
+                                this.inspect(track, window, cx);
+                            }
                         }
                     }
                     _ => {}
@@ -440,8 +549,11 @@ impl LibraryView {
             error,
             notice: None,
             compact,
+            wheel_in_browser: false,
+            wheel_open: false,
+            wheel_dismissed: None,
             section: Section::Library,
-            origin: Origin::Local,
+            origin: Origin::All,
             sources: Vec::new(),
             selected: None,
             playlists: Vec::new(),
@@ -458,6 +570,9 @@ impl LibraryView {
             editing: false,
             running_scans: 0,
             scan_counters: Arc::default(),
+            flow: (!compact).then(|| cx.new(|cx| crate::flow_view::FlowView::new(window, cx))),
+            wheel_key: None,
+            key_counts: HashMap::new(),
             analysing: false,
             analysis: Arc::default(),
         };
@@ -526,9 +641,17 @@ impl LibraryView {
         };
         let in_playlists = self.section == Section::Playlists;
         let query = TrackQuery {
+            id: None,
             source: self.selected.filter(|_| !in_playlists),
             playlist: self.playlist.filter(|_| in_playlists),
             search: self.search.read(cx).value().to_string(),
+            // On the wheel, a chosen key lists everything that mixes with it.
+            keys: self
+                .wheel_key
+                // In a browser the wheel filters whatever is listed.
+                .filter(|_| self.section == Section::Library || self.compact)
+                .map(|key| key.compatible().to_vec())
+                .unwrap_or_default(),
         };
         let loaded = (|| {
             let tracks = if in_playlists && query.playlist.is_none() {
@@ -536,6 +659,7 @@ impl LibraryView {
             } else {
                 library.tracks(&query)?
             };
+            self.key_counts = library.key_counts()?;
             Ok::<_, djcraft_library::Error>((library.sources()?, library.playlists()?, tracks))
         })();
         match loaded {
@@ -556,6 +680,12 @@ impl LibraryView {
 
     fn show_section(&mut self, section: Section, cx: &mut Context<Self>) {
         self.section = section;
+        match (section, &self.flow) {
+            (Section::Flow, Some(flow)) => flow.update(cx, |flow, cx| flow.refresh(cx)),
+            // Leaving Flow stops its player.
+            (_, Some(flow)) => flow.update(cx, |flow, _| flow.pause()),
+            _ => {}
+        }
         if section == Section::Playlists && self.playlist.is_none() {
             self.playlist = self.playlists.first().map(|playlist| playlist.id);
         }
@@ -613,6 +743,7 @@ impl LibraryView {
         let tracks = &self.table.read(cx).delegate().tracks;
         if let Some(track) = tracks.iter().find(|t| t.id == track) {
             cx.emit(LibraryEvent::Load {
+                id: track.id,
                 path: track.path.clone(),
                 deck: Some(deck as usize),
             });
@@ -989,6 +1120,20 @@ impl LibraryView {
             }))
     }
 
+    /// Gives a compact browser a button that pops up the Camelot wheel.
+    pub fn show_wheel(&mut self, cx: &mut Context<Self>) {
+        self.wheel_in_browser = true;
+        self.wheel_open = true;
+        cx.notify();
+    }
+
+    /// Stops anything this view is playing, for when it goes out of view.
+    pub fn pause_players(&mut self, cx: &mut Context<Self>) {
+        if let Some(flow) = &self.flow {
+            flow.update(cx, |flow, _| flow.pause());
+        }
+    }
+
     /// Re-reads the database, after another view may have changed it.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         self.reload(cx);
@@ -1271,7 +1416,7 @@ impl LibraryView {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .children(Origin::ALL.map(|origin| {
+                    .children(Origin::ALL.into_iter().skip(1).map(|origin| {
                         let (icon, name) = origin.icon_and_label();
                         let status = match origin {
                             Origin::Local => "Built in",
@@ -1313,6 +1458,9 @@ impl LibraryView {
                 .on_click(cx.listener(move |this, _, _, cx| this.select(source, cx)))
         };
         div()
+            .id("folders")
+            // A browser's panel is short; let it scroll once the wheel is in.
+            .overflow_y_scroll()
             .flex()
             .flex_col()
             .w(px(220.))
@@ -1392,6 +1540,7 @@ impl LibraryView {
             })
             .when(!self.compact, |this| {
                 this.child(div().flex_1())
+                    .child(self.wheel(cx))
                     .child(
                         Button::new("import-to-library")
                             .outline()
@@ -1473,7 +1622,253 @@ impl LibraryView {
                     .tooltip("From a rekordbox XML export, a VirtualDJ folder or M3U files")
                     .on_click(cx.listener(|this, _, _, cx| this.import_playlists(cx))),
             )
-            .child(Input::new(&self.new_playlist))
+            .child(self.export_button(cx))
+            .child(
+                Button::new("new-playlist")
+                    .outline()
+                    .icon(IconName::Plus)
+                    .label("New playlist")
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.new_playlist_dialog(window, cx)),
+                    ),
+            )
+    }
+
+    /// Asks for a name and creates a playlist with it.
+    fn new_playlist_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let input = self.new_playlist.clone();
+        input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+            input.focus(window, cx);
+        });
+        let view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let view = view.clone();
+            dialog
+                .title("New playlist")
+                .w(px(420.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(div().text_sm().child("Name"))
+                        .child(Input::new(&input)),
+                )
+                .footer(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("cancel-new-playlist")
+                                .outline()
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("create-new-playlist")
+                                .primary()
+                                .label("Create")
+                                .on_click(move |_, window, cx| {
+                                    let created = view
+                                        .update(cx, |view, cx| view.create_named_playlist(cx))
+                                        .unwrap_or(false);
+                                    // An empty name keeps the dialog open.
+                                    if created {
+                                        window.close_dialog(cx);
+                                    }
+                                }),
+                        ),
+                )
+        });
+    }
+
+    /// Creates a playlist named by the dialog's text box. Returns false, and
+    /// does nothing, if no name has been typed.
+    fn create_named_playlist(&mut self, cx: &mut Context<Self>) -> bool {
+        let name = self.new_playlist.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            return false;
+        }
+        self.create_playlist(&name, cx);
+        true
+    }
+
+    /// A menu of file formats to save the open playlist in.
+    fn export_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.weak_entity();
+        Button::new("export-playlist")
+            .outline()
+            .icon(IconName::Upload)
+            .label("Export playlist")
+            .dropdown_caret(true)
+            .disabled(self.playlist.is_none())
+            .dropdown_menu(move |menu, _, _| {
+                let item = |label: &'static str, extension: &'static str| {
+                    let view = view.clone();
+                    PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                        view.update(cx, |view, cx| view.export_playlist(extension, cx))
+                            .ok();
+                    })
+                };
+                menu.item(item("M3U playlist (most DJ software)", "m3u8"))
+                    .item(item("rekordbox XML", "xml"))
+            })
+    }
+
+    /// Asks where to save, and writes the open playlist there.
+    fn export_playlist(&mut self, extension: &'static str, cx: &mut Context<Self>) {
+        let Some(playlist) = self.playlist else {
+            return;
+        };
+        let name = self
+            .playlists
+            .iter()
+            .find(|candidate| candidate.id == playlist)
+            .map(|found| found.name.clone())
+            .unwrap_or_else(|| "Playlist".into());
+        // Slashes would be read as folders in a file name.
+        let suggested = format!("{}.{extension}", name.replace(['/', ':'], "-"));
+        let folder = dirs::document_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_default();
+        let chosen = cx.prompt_for_new_path(&folder, Some(&suggested));
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(mut file))) = chosen.await else {
+                return;
+            };
+            // The format follows the extension, so make sure it is there.
+            if file.extension().and_then(|e| e.to_str()) != Some(extension) {
+                file.set_extension(extension);
+            }
+            this.update(cx, |this, cx| {
+                let Some(library) = &this.library else {
+                    return;
+                };
+                match library.export_playlist(playlist, &file) {
+                    Ok(count) => {
+                        let tracks = if count == 1 { "track" } else { "tracks" };
+                        this.notice = Some(
+                            format!("Exported {count} {tracks} to {}.", file.display()).into(),
+                        );
+                    }
+                    Err(error) => this.error = Some(error.to_string().into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The Camelot wheel: major keys on the outer ring, minor on the inner.
+    /// Picking a key lights up the keys that mix with it and narrows the
+    /// track list to them.
+    fn wheel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        const SIZE: f32 = 204.;
+        const LABEL: f32 = 24.;
+        // Inner and outer edge of each ring.
+        const MINOR: (f32, f32) = (44., 71.);
+        const MAJOR: (f32, f32) = (73., 100.);
+
+        let muted = cx.theme().muted_foreground;
+        let picked = self.wheel_key;
+        let lit = picked.map(|key| key.compatible());
+        // Twelve o'clock is 12; each number is a twelfth of a turn on.
+        let angle = |key: Camelot| (key.number % 12) as f32 * (TAU / 12.) - TAU / 4.;
+        let strength = move |key: Camelot| match lit {
+            None => 0.85,
+            Some(lit) if lit[0] == key => 1.,
+            Some(lit) if lit.contains(&key) => 0.8,
+            Some(_) => 0.18,
+        };
+
+        let segments = canvas(
+            |_, _, _| (),
+            move |bounds, _, window, _| {
+                let centre = bounds.origin + point(px(SIZE / 2.), px(SIZE / 2.));
+                let at = |radius: f32, angle: f32| {
+                    centre + point(px(radius * angle.cos()), px(radius * angle.sin()))
+                };
+                for key in Camelot::all() {
+                    let (inner, outer) = if key.major { MAJOR } else { MINOR };
+                    // A sliver is left between neighbours.
+                    let (from, to) = (angle(key) - TAU / 24. + 0.02, angle(key) + TAU / 24. - 0.02);
+                    let steps = 8;
+                    let sweep = |step: usize| from + (to - from) * step as f32 / steps as f32;
+                    let mut path = PathBuilder::fill();
+                    path.move_to(at(outer, from));
+                    for step in 1..=steps {
+                        path.line_to(at(outer, sweep(step)));
+                    }
+                    for step in (0..=steps).rev() {
+                        path.line_to(at(inner, sweep(step)));
+                    }
+                    path.close();
+                    if let Ok(path) = path.build() {
+                        window.paint_path(path, key_colour(key, strength(key)));
+                    }
+                }
+            },
+        )
+        .absolute()
+        .size_full();
+
+        let labels = Camelot::all().map(|key| {
+            let (inner, outer) = if key.major { MAJOR } else { MINOR };
+            let radius = (inner + outer) / 2.;
+            let dimmed = lit.is_some_and(|lit| !lit.contains(&key));
+            let count = self.key_counts.get(&key).copied().unwrap_or(0);
+            div()
+                .id(("wheel-key", key.number as usize * 2 + key.major as usize))
+                .absolute()
+                .left(px(SIZE / 2. + radius * angle(key).cos() - LABEL / 2.))
+                .top(px(SIZE / 2. + radius * angle(key).sin() - LABEL / 2.))
+                .size(px(LABEL))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(10.))
+                .font_weight(FontWeight::BOLD)
+                .text_color(gpui_kit::white().opacity(if dimmed { 0.45 } else { 1. }))
+                .child(key.to_string())
+                .tooltip(move |window, cx| {
+                    let tracks = if count == 1 { "track" } else { "tracks" };
+                    Tooltip::new(format!("{} · {count} {tracks}", key.name())).build(window, cx)
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.wheel_key = (this.wheel_key != Some(key)).then_some(key);
+                    this.reload(cx);
+                }))
+        });
+
+        let hub = div()
+            .absolute()
+            .left(px(SIZE / 2. - 40.))
+            .top(px(SIZE / 2. - 20.))
+            .w(px(80.))
+            .h(px(40.))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .map(|this| match picked {
+                Some(key) => this
+                    .child(div().font_weight(FontWeight::BOLD).child(key.to_string()))
+                    .child(div().text_size(px(10.)).text_color(muted).child(key.name())),
+                None => this.child(div().text_xs().text_color(muted).child("Any key")),
+            });
+
+        div().flex().justify_center().py_2().child(
+            div()
+                .relative()
+                .flex_none()
+                .size(px(SIZE))
+                .child(segments)
+                .children(labels)
+                .child(hub),
+        )
     }
 
     /// Local music: folders on the left, their tracks on the right.
@@ -1513,6 +1908,62 @@ impl LibraryView {
             .child(self.track_pane(empty, cx))
             .when_some(self.inspected.clone(), |this, track| {
                 this.child(self.info_panel(&track, cx))
+            })
+    }
+
+    /// A button showing the key picked on the Camelot wheel, which opens
+    /// the wheel in a panel floating below it.
+    fn wheel_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (border, background) = (theme.border, theme.background);
+        let label: SharedString = match self.wheel_key {
+            Some(key) => key.to_string().into(),
+            None => "Key".into(),
+        };
+        div()
+            .relative()
+            .child(
+                Button::new("open-wheel")
+                    .outline()
+                    .small()
+                    .icon(IconName::CircleDashed)
+                    .label(label)
+                    .tooltip("Show tracks that mix with a key")
+                    .selected(self.wheel_open || self.wheel_key.is_some())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        // A click on this button while the wheel is open has
+                        // already closed it, as a click outside the wheel;
+                        // it must not open it again.
+                        let just_dismissed = this
+                            .wheel_dismissed
+                            .take()
+                            .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
+                        this.wheel_open = !just_dismissed;
+                        cx.notify();
+                    })),
+            )
+            .when(self.wheel_open, |this| {
+                // Painted last, so it floats over the track list.
+                this.child(deferred(
+                    div()
+                        .id("wheel-popup")
+                        .absolute()
+                        .top(px(36.))
+                        .right_0()
+                        .occlude()
+                        .p_2()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(border)
+                        .bg(background)
+                        .shadow_lg()
+                        .child(self.wheel(cx))
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.wheel_open = false;
+                            this.wheel_dismissed = Some(Instant::now());
+                            cx.notify();
+                        })),
+                ))
             })
     }
 
@@ -1559,19 +2010,11 @@ impl LibraryView {
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
                             .child(status),
-                    ),
+                    )
+                    .when(self.wheel_in_browser, |this| {
+                        this.child(self.wheel_button(cx))
+                    }),
             )
-            .when_some(self.error.clone(), |this, error| {
-                this.child(div().text_color(cx.theme().danger).child(error))
-            })
-            .when_some(self.notice.clone(), |this, notice| {
-                this.child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(notice),
-                )
-            })
             .child(match empty {
                 Some(text) => self.placeholder(text, cx),
                 None => div()
@@ -1617,7 +2060,19 @@ fn import_notice(summary: ImportSummary) -> String {
 impl EventEmitter<LibraryEvent> for LibraryView {}
 
 impl Render for LibraryView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Problems and results are shown as toasts, once each.
+        let (error, notice) = (self.error.take(), self.notice.take());
+        if error.is_some() || notice.is_some() {
+            window.defer(cx, move |window, cx| {
+                if let Some(error) = error {
+                    window.push_notification(Notification::error(error), cx);
+                }
+                if let Some(notice) = notice {
+                    window.push_notification(Notification::info(notice), cx);
+                }
+            });
+        }
         if self.compact {
             return div()
                 .flex()
@@ -1635,15 +2090,23 @@ impl Render for LibraryView {
                 .gap_3()
                 .child(self.origin_tabs(cx))
                 .child(match self.origin {
-                    Origin::Local => self.local(cx),
+                    // Local folders are the only connected source so far, so
+                    // "All" and "Local" list the same tracks.
+                    Origin::All | Origin::Local => self.local(cx),
                     Origin::AppleMusic => self.placeholder("Apple Music is not connected yet.", cx),
                     Origin::Spotify => self.placeholder("Spotify is not connected yet.", cx),
                     Origin::Plugins => self.plugins(cx),
                 }),
             Section::Playlists => self.playlists(cx),
-            Section::Camelot => {
-                self.placeholder("The Camelot wheel arrives with key analysis.", cx)
-            }
+            Section::Flow => match &self.flow {
+                Some(flow) => div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .child(flow.clone()),
+                None => self.placeholder("Flow is not available here.", cx),
+            },
             Section::History => self.placeholder("Play history is not built yet.", cx),
         };
         div()

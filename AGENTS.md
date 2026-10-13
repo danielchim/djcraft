@@ -28,7 +28,7 @@ alone.
   database access; the app decodes, analyses and stores.
 - `crates/library`: SQLite library, scanning, tags, playlists, import, lookups.
 - `crates/app`: the GPUI application. `shell.rs` is the window, `library_view.rs`
-  the Library tab and the track browser, `settings_view.rs` the settings dialog.
+  the Library tab and the track browser, `flow_view.rs` the Flow timeline editor, `settings_view.rs` the settings dialog.
 
 ## Rules
 

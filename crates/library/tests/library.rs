@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use djcraft_library::{
-    ImportSummary, Library, ScanSummary, SourceKind, TempoResult, TrackEdit, TrackQuery,
-    read_artwork, read_playlists,
+    Camelot, ClipPlacement, CuePoint, ImportSummary, Library, ScanSummary, SourceKind, TempoResult,
+    TrackEdit, TrackQuery, read_artwork, read_playlists,
 };
 use lofty::config::WriteOptions;
 use lofty::tag::{Accessor, ItemKey, Tag, TagExt, TagType};
@@ -27,8 +27,12 @@ impl Drop for TempDir {
 
 /// Writes one second of silence as a 16-bit mono WAV file.
 fn write_wav(path: &Path) {
+    write_wav_of(path, 1);
+}
+
+fn write_wav_of(path: &Path, seconds: usize) {
     let rate = 8000u32;
-    let data = vec![0u8; rate as usize * 2];
+    let data = vec![0u8; rate as usize * 2 * seconds];
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"RIFF");
     bytes.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
@@ -330,6 +334,9 @@ fn an_existing_library_gains_playlists_on_upgrade() {
     let raw = rusqlite::Connection::open(&db).unwrap();
     raw.execute_batch(
         "DROP TABLE playlist_tracks; DROP TABLE playlists;
+         ALTER TABLE tracks DROP COLUMN cues_manual;
+         DROP TABLE cues; ALTER TABLE tracks DROP COLUMN energy;
+         DROP TABLE flow_clips; DROP TABLE flows;
          ALTER TABLE tracks DROP COLUMN tempo_bpm;
          ALTER TABLE tracks DROP COLUMN tempo_first_beat;
          ALTER TABLE tracks DROP COLUMN tempo_confidence;
@@ -434,6 +441,8 @@ fn imports_rekordbox_xml_playlists() {
     // The track already in a library folder is reused, not duplicated; the
     // other one lives under the loose-files source and can still be found.
     assert_eq!(tracks[1].source_id, folder.id);
+    assert_eq!(tracks[1].source_name, folder.name);
+    assert_eq!(tracks[0].source_name, "Imported files");
     assert_eq!(tracks[0].path, elsewhere_dir.join("loose.wav"));
     assert_eq!(library.tracks(&TrackQuery::default()).unwrap().len(), 2);
     let kinds: Vec<_> = library
@@ -689,5 +698,221 @@ fn measured_tempo_is_stored_and_shown() {
     assert_eq!(
         pending.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
         [bare]
+    );
+}
+
+#[test]
+fn tracks_can_be_counted_and_filtered_by_key() {
+    let dir = TempDir::new("keys");
+    write_tagged(&dir.0.join("a.wav"), "One", "A", "", "120", "8A");
+    write_tagged(&dir.0.join("b.wav"), "Two", "A", "", "120", "Am");
+    write_tagged(&dir.0.join("c.wav"), "Three", "A", "", "120", "C");
+    write_tagged(&dir.0.join("d.wav"), "Four", "A", "", "120", "F#m");
+    write_tagged(&dir.0.join("e.wav"), "Five", "A", "", "120", "nonsense");
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+
+    let key = |text: &str| Camelot::parse(text).unwrap();
+    let counts = library.key_counts().unwrap();
+    assert_eq!(counts.get(&key("8A")), Some(&2));
+    assert_eq!(counts.get(&key("8B")), Some(&1));
+    assert_eq!(counts.get(&key("11A")), Some(&1));
+    assert_eq!(counts.len(), 3);
+
+    // Everything that mixes with A minor: 8A itself, 7A, 9A and 8B.
+    let query = TrackQuery {
+        keys: key("8A").compatible().to_vec(),
+        ..Default::default()
+    };
+    let mut titles: Vec<_> = library
+        .tracks(&query)
+        .unwrap()
+        .into_iter()
+        .map(|t| t.title)
+        .collect();
+    titles.sort();
+    assert_eq!(titles, ["One", "Three", "Two"]);
+
+    let all = library.tracks(&TrackQuery::default()).unwrap();
+    let five = all.iter().find(|t| t.title == "Five").unwrap();
+    assert_eq!(
+        (five.key.as_deref(), five.camelot),
+        (Some("nonsense"), None)
+    );
+}
+
+#[test]
+fn flows_place_and_trim_clips_on_lanes() {
+    let dir = TempDir::new("flow");
+    write_tagged(&dir.0.join("a.wav"), "First", "A", "", "120", "8A");
+    write_wav_of(&dir.0.join("long.wav"), 10);
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let all = library.tracks(&TrackQuery::default()).unwrap();
+    let id_of = |title: &str| all.iter().find(|t| t.title == title).unwrap().id;
+    let (first, second) = (id_of("First"), id_of("long"));
+    let grid = TempoResult {
+        bpm: 120.0,
+        first_beat_seconds: 0.1,
+        confidence: 0.5,
+    };
+    library.store_tempo(first, 1, Some(grid)).unwrap();
+
+    let flow = library.create_flow("Friday").unwrap();
+    let one = library.add_clip(flow.id, first, 0, 0.0).unwrap();
+    // The same track may be used more than once.
+    let two = library.add_clip(flow.id, second, 1, 0.6).unwrap();
+    library.add_clip(flow.id, first, 9, -5.0).unwrap();
+
+    let clips = library.flow_clips(flow.id).unwrap();
+    assert_eq!(clips.len(), 3);
+    // Out-of-range lanes and times are brought back onto the timeline.
+    assert_eq!((clips[1].lane, clips[1].start), (3, 0.0));
+    let whole = &clips[0];
+    assert_eq!((whole.id, whole.lane, whole.offset), (one, 0, 0.0));
+    assert!((whole.length - 1.0).abs() < 0.05);
+    assert_eq!(whole.track.title, "First");
+    assert_eq!(whole.grid, Some(grid));
+    assert_eq!(clips[2].grid, None);
+    assert_eq!(library.flows().unwrap()[0].clip_count, 3);
+
+    // Cue points and energy belong to the track, and come with its clips.
+    let cues = [
+        CuePoint {
+            seconds: 0.1,
+            energy: 3,
+        },
+        CuePoint {
+            seconds: 0.6,
+            energy: 9,
+        },
+    ];
+    library.store_structure(first, Some(8), &cues).unwrap();
+    library.store_structure(first, Some(7), &cues).unwrap();
+    let clips = library.flow_clips(flow.id).unwrap();
+    assert_eq!(clips[0].cues, cues);
+    assert_eq!(clips[0].track.energy, Some(7));
+    assert_eq!((clips[2].cues.len(), clips[2].track.energy), (0, None));
+
+    // Cue points edited by hand are sorted, and survive later analysis.
+    let mine = [
+        CuePoint {
+            seconds: 0.8,
+            energy: 6,
+        },
+        CuePoint {
+            seconds: 0.2,
+            energy: 4,
+        },
+    ];
+    library.set_cues(first, &mine).unwrap();
+    library.store_structure(first, Some(9), &cues).unwrap();
+    let seconds: Vec<f64> = library
+        .cues(first)
+        .unwrap()
+        .iter()
+        .map(|c| c.seconds)
+        .collect();
+    assert_eq!(seconds, [0.2, 0.8]);
+    assert_eq!(library.track(first).unwrap().unwrap().energy, Some(9));
+    library.set_cues(first, &cues).unwrap();
+
+    library.rename_flow(flow.id, "Saturday").unwrap();
+    assert_eq!(library.flows().unwrap()[0].name, "Saturday");
+
+    // A clip cannot be trimmed past the ends of its track.
+    let placed = |library: &Library, placement| {
+        library.place_clip(two, placement).unwrap();
+        let clips = library.flow_clips(flow.id).unwrap();
+        let clip = clips.into_iter().find(|c| c.id == two).unwrap();
+        (clip.lane, clip.start, clip.offset, clip.length)
+    };
+    let trimmed = ClipPlacement {
+        lane: 2,
+        start: 30.0,
+        offset: 2.5,
+        length: 4.0,
+    };
+    assert_eq!(placed(&library, trimmed), (2, 30.0, 2.5, 4.0));
+    let too_long = ClipPlacement {
+        length: 99.0,
+        ..trimmed
+    };
+    assert_eq!(placed(&library, too_long), (2, 30.0, 2.5, 7.5));
+    let too_late = ClipPlacement {
+        offset: 99.0,
+        length: 0.0,
+        ..trimmed
+    };
+    assert_eq!(placed(&library, too_late), (2, 30.0, 9.0, 1.0));
+
+    library.remove_clip(one).unwrap();
+    assert_eq!(library.flow_clips(flow.id).unwrap().len(), 2);
+
+    // Clips go when their track leaves the library, and with their flow.
+    library.remove_source(source.id).unwrap();
+    assert!(library.flow_clips(flow.id).unwrap().is_empty());
+    library.delete_flow(flow.id).unwrap();
+    assert!(library.flows().unwrap().is_empty());
+}
+
+#[test]
+fn exported_playlists_can_be_read_back() {
+    let dir = TempDir::new("export");
+    let awkward = r#"One <&> "Two""#;
+    write_tagged(
+        &dir.0.join("one & two.wav"),
+        awkward,
+        "A & B",
+        "House",
+        "124",
+        "8A",
+    );
+    write_tagged(&dir.0.join("café #3.wav"), "Three", "", "", "128", "Am");
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let all = library.tracks(&TrackQuery::default()).unwrap();
+    let id_of = |title: &str| all.iter().find(|t| t.title == title).unwrap().id;
+    let name = r#"Set "A" & B"#;
+    let playlist = library.create_playlist(name).unwrap();
+    library
+        .add_to_playlist(playlist.id, &[id_of("Three"), id_of(awkward)])
+        .unwrap();
+    let expected: Vec<PathBuf> = {
+        let query = TrackQuery {
+            playlist: Some(playlist.id),
+            ..Default::default()
+        };
+        library
+            .tracks(&query)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.path)
+            .collect()
+    };
+    assert_eq!(expected.len(), 2);
+
+    for file in ["set.m3u8", "set.xml"] {
+        let file = dir.0.join(file);
+        assert_eq!(library.export_playlist(playlist.id, &file).unwrap(), 2);
+        let read = read_playlists(&file).unwrap();
+        assert_eq!(read.len(), 1, "{}", file.display());
+        assert_eq!(read[0].files, expected, "{}", file.display());
+    }
+    // rekordbox XML carries the playlist's name; an M3U is named by its file.
+    assert_eq!(
+        read_playlists(&dir.0.join("set.xml")).unwrap()[0].name,
+        name
+    );
+    let xml = std::fs::read_to_string(dir.0.join("set.xml")).unwrap();
+    assert!(xml.contains(r#"AverageBpm="128.00""#) && xml.contains(r#"Tonality="8A""#));
+
+    assert!(
+        library
+            .export_playlist(playlist.id, &dir.0.join("set.txt"))
+            .is_err()
     );
 }

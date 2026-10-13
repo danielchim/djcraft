@@ -65,18 +65,20 @@ impl Shell {
         let library = cx.new(|cx| LibraryView::new(false, scan, window, cx));
         library.update(cx, |view, cx| view.set_provider(settings.info_provider, cx));
         cx.subscribe(&library, |this, _, event: &LibraryEvent, cx| match event {
-            LibraryEvent::Load { path, deck } => {
+            LibraryEvent::Load { path, deck, .. } => {
                 this.load_from_library(path, *deck);
                 this.show(Tab::Live, cx);
             }
+            LibraryEvent::Selected { .. } => {}
         })
         .detach();
         let browser = cx.new(|cx| LibraryView::new(true, false, window, cx));
         cx.subscribe(&browser, |this, _, event: &LibraryEvent, cx| match event {
-            LibraryEvent::Load { path, deck } => {
+            LibraryEvent::Load { path, deck, .. } => {
                 this.load_from_library(path, *deck);
                 cx.notify();
             }
+            LibraryEvent::Selected { .. } => {}
         })
         .detach();
         let mut shell = Self {
@@ -111,6 +113,9 @@ impl Shell {
             Tab::Library => self.library.update(cx, |view, cx| view.refresh(cx)),
             Tab::Live => self.browser.update(cx, |view, cx| view.refresh(cx)),
             Tab::Radio => {}
+        }
+        if tab != Tab::Library {
+            self.library.update(cx, |view, cx| view.pause_players(cx));
         }
         cx.notify();
     }

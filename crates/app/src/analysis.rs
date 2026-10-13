@@ -5,13 +5,13 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, mpsc};
 
-use djcraft_analysis::{TempoRange, detect_tempo};
+use djcraft_analysis::{TempoRange, detect_structure, detect_tempo};
 use djcraft_engine::Track;
-use djcraft_library::{Library, TempoResult};
+use djcraft_library::{CuePoint, Library, TempoResult};
 
-/// Raise this when tempo detection changes enough that every track should
-/// be analysed again.
-const TEMPO_VERSION: i64 = 1;
+/// Raise this when the analysis changes enough that every track should be
+/// analysed again. Version 2 added energy and cue points.
+const ANALYSIS_VERSION: i64 = 2;
 /// Tempo does not need treble, and a lower rate is quicker to decode.
 const ANALYSIS_RATE: u32 = 22_050;
 const MAX_WORKERS: usize = 4;
@@ -25,8 +25,8 @@ pub struct Progress {
 /// Analyses every track that needs it and stores the results. Blocking, and
 /// busy on several threads; run it off the UI thread.
 pub fn analyse_pending(db_path: &Path, progress: &Progress) -> djcraft_library::Result<()> {
-    let library = Library::open(db_path)?;
-    let pending = library.pending_tempo_analysis(TEMPO_VERSION)?;
+    let mut library = Library::open(db_path)?;
+    let pending = library.pending_tempo_analysis(ANALYSIS_VERSION)?;
     progress.done.store(0, Ordering::Relaxed);
     progress.total.store(pending.len(), Ordering::Relaxed);
     if pending.is_empty() {
@@ -39,7 +39,7 @@ pub fn analyse_pending(db_path: &Path, progress: &Progress) -> djcraft_library::
         .unwrap_or(1)
         .clamp(1, MAX_WORKERS);
     let queue = Mutex::new(VecDeque::from(pending));
-    let (results, received) = mpsc::channel::<(i64, Option<TempoResult>)>();
+    let (results, received) = mpsc::channel::<(i64, Analysis)>();
 
     std::thread::scope(|scope| {
         for _ in 0..workers {
@@ -59,21 +59,51 @@ pub fn analyse_pending(db_path: &Path, progress: &Progress) -> djcraft_library::
         }
         drop(results);
         // Results are written from this one thread as they arrive.
-        for (id, tempo) in received {
-            library.store_tempo(id, TEMPO_VERSION, tempo)?;
+        for (id, analysis) in received {
+            library.store_structure(id, analysis.energy, &analysis.cues)?;
+            // Last, as this is what marks the track as analysed.
+            library.store_tempo(id, ANALYSIS_VERSION, analysis.tempo)?;
             progress.done.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
     })
 }
 
-/// A file that cannot be decoded simply has no tempo.
-fn analyse(path: &Path) -> Option<TempoResult> {
-    let track = Track::decode(path, ANALYSIS_RATE).ok()?;
-    let tempo = detect_tempo(&track.mono(), ANALYSIS_RATE, TempoRange::default())?;
-    Some(TempoResult {
-        bpm: tempo.bpm,
-        first_beat_seconds: tempo.first_beat_seconds,
-        confidence: tempo.confidence as f64,
-    })
+#[derive(Default)]
+struct Analysis {
+    tempo: Option<TempoResult>,
+    energy: Option<u8>,
+    cues: Vec<CuePoint>,
+}
+
+/// A file that cannot be decoded simply has nothing to report.
+fn analyse(path: &Path) -> Analysis {
+    let Ok(track) = Track::decode(path, ANALYSIS_RATE) else {
+        return Analysis::default();
+    };
+    let samples = track.mono();
+    let tempo = detect_tempo(&samples, ANALYSIS_RATE, TempoRange::default());
+    // Cue points sit on the bar lines of a tempo worth trusting.
+    let structure = detect_structure(
+        &samples,
+        ANALYSIS_RATE,
+        tempo.filter(|t| t.confidence >= 0.1),
+    );
+    Analysis {
+        tempo: tempo.map(|tempo| TempoResult {
+            bpm: tempo.bpm,
+            first_beat_seconds: tempo.first_beat_seconds,
+            confidence: tempo.confidence as f64,
+        }),
+        energy: structure.as_ref().map(|structure| structure.energy),
+        cues: structure
+            .map(|structure| structure.cues)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|cue| CuePoint {
+                seconds: cue.seconds,
+                energy: cue.energy,
+            })
+            .collect(),
+    }
 }

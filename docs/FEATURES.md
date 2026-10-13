@@ -62,19 +62,27 @@ Status key: `[ ]` to do, `[~]` in progress, `[x]` done.
 
 Feature set modelled on Mixed In Key 10.
 
-- [ ] Camelot wheel notation, with a choice of notation (Camelot, musical,
-      Open Key) and optional zero-padding (`08A`)
+- [~] Camelot wheel notation, with a choice of notation (Camelot, musical,
+      Open Key) and optional zero-padding (`08A`) (keys in tags are read in
+      any of the three and shown as Camelot; no choice of notation yet)
 - [ ] Key segments: key changes within a track, each with a confidence value
 - [ ] Tuning detection for tracks not pitched to A440
-- [ ] Energy level per track on a 1–10 scale
-- [ ] Energy segments along the track, drawn on the waveform
+- [~] Energy level per track on a 1–10 scale (from loudness, so loudly
+      mastered tracks crowd the top of the scale)
+- [~] Energy segments along the track, drawn on the waveform (each cue point
+      carries its section's energy; shown on Flow clips, not on deck
+      waveforms)
 - [ ] Danceability score
-- [ ] Automatic cue points (up to 8) placed at energy and structure changes
+- [~] Automatic cue points (up to 8) placed at energy and structure changes
+      (detected and stored; shown and editable in Flow's player; no export
+      to other DJ software yet)
 - [ ] Cue point export to rekordbox, Serato and Traktor, with an option not to
       overwrite existing cues
 - [ ] Audio quality warnings: clipping, low volume, low-bitrate source
 - [ ] On-screen piano to check a detected key by ear, playable from MIDI
-- [ ] Sort and filter by compatible key and by energy for set building
+- [~] Sort and filter by compatible key and by energy for set building (the
+      Camelot wheel in the Library's side panel narrows the list to a key
+      and the keys that mix with it; nothing by energy yet)
 
 ### Tags
 
@@ -92,12 +100,33 @@ Feature set modelled on Mixed In Key 10.
       spaces, fix capitalisation
 - [ ] Rename files from tags using a format template
 
+### Flow (set planning)
+
+- [~] Timeline editor with four lanes, matching the decks: place tracks,
+      move them between lanes, and trim either end (built; planning only, no
+      audio)
+- [~] Trim snaps to the track's bars; a moved clip snaps to other clips' edges
+      (bars are counted from the first beat, since downbeats are not detected)
+- [~] Transition notes where one track comes in over another: tempo change
+      and whether the keys mix
+- [~] Add tracks by double-click (appended with a typical overlap) or by
+      dragging onto a lane
+- [ ] Export a flow to a playlist, or load it onto the decks in order
+- [~] Player in the editor for one track at a time: whole-track waveform,
+      cue point flags, jump between cues, add and delete cues (it plays
+      through its own output, not the decks' headphone cue)
+- [x] Opens on a new flow; saved flows are picked from a dropdown
+- [ ] Preview transitions in the editor (needs sync and crossfade)
+- [~] Waveforms and cue points on clips (cue points and energy are drawn,
+      and trims snap to cue points; no waveforms)
+- [x] Delete or Backspace removes the selected clip
+
 ### Organisation
 
 - [~] Track browser with virtualised table, sorting, column chooser, search
       (no column chooser yet)
-- [~] Playlists and folders (create, delete, add and remove tracks; no
-      rename, reordering or folders in the UI yet)
+- [~] Playlists and folders (create from a dialog, delete, add and remove
+      tracks, export; no rename, reordering or folders in the UI yet)
 - [ ] Smart playlists (rule-based)
 - [ ] Auto-classification by genre, energy and era
 - [ ] Key/BPM compatibility hints for the next track
@@ -109,7 +138,9 @@ Feature set modelled on Mixed In Key 10.
 - [~] Import rekordbox XML (playlists and their tracks; cues, grids, BPM and
       key in the file are not read yet)
 - [ ] Import an existing rekordbox library database
-- [ ] Export rekordbox XML
+- [~] Export rekordbox XML (one playlist at a time, with BPM and key; no
+      cue points or beat grids)
+- [x] Export M3U playlists
 - [ ] Export to USB for Pioneer players
 - [~] Import VirtualDJ playlists (`.vdjfolder` and `.m3u`; written from the
       documented format, not yet tried on a real VirtualDJ folder)

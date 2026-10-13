@@ -4,10 +4,14 @@
 //! folders are the only source so far; other kinds (network shares, plugin
 //! sources) fit the same two fields.
 
+mod camelot;
+mod export;
+mod flow;
 mod import;
 pub mod lookup;
 mod scan;
 
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -15,10 +19,12 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+pub use camelot::Camelot;
+pub use flow::{ClipPlacement, FLOW_LANES, Flow, FlowClip, MIN_CLIP_SECONDS};
 pub use import::{ImportSummary, ImportedPlaylist, read_playlists};
 pub use scan::{Artwork, ScanProgress, ScanSummary, TrackEdit, read_artwork};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 6;
 
 /// A measured tempo is shown only when the analysis was at least this sure
 /// of it. Below that (mixes with several tempos, music with no clear beat)
@@ -93,6 +99,9 @@ pub enum SourceKind {
 pub struct Track {
     pub id: i64,
     pub source_id: i64,
+    /// The name of the source the track came from, such as its folder.
+    pub source_name: String,
+    pub source_kind: SourceKind,
     /// Where to load the track from.
     pub path: PathBuf,
     pub title: String,
@@ -103,7 +112,20 @@ pub struct Track {
     /// The measured tempo when there is a trustworthy one, otherwise the
     /// tempo from the file's tags.
     pub bpm: Option<f64>,
+    /// The key as the file's tags spell it.
     pub key: Option<String>,
+    /// The key's place on the Camelot wheel, when the tag can be understood.
+    pub camelot: Option<Camelot>,
+    /// Energy of the track as a whole, 1 to 10, once analysed.
+    pub energy: Option<u8>,
+}
+
+/// A point in a track where a new section begins.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CuePoint {
+    pub seconds: f64,
+    /// Energy of the section that starts here, 1 to 10.
+    pub energy: u8,
 }
 
 /// What tempo analysis found for a track.
@@ -125,12 +147,16 @@ pub struct Playlist {
 /// Which tracks to list.
 #[derive(Clone, Debug, Default)]
 pub struct TrackQuery {
+    /// Only this track.
+    pub id: Option<i64>,
     /// Only tracks from this source.
     pub source: Option<i64>,
     /// Only tracks in this playlist, in playlist order.
     pub playlist: Option<i64>,
     /// Words that must each appear in the title, artist, album or genre.
     pub search: String,
+    /// Only tracks in one of these keys. Empty means any key.
+    pub keys: Vec<Camelot>,
 }
 
 /// One connection to the library database. Open one per thread; they share
@@ -229,6 +255,58 @@ impl Library {
                  COMMIT;",
             )?;
         }
+        if version < 4 {
+            // Flows: sets planned on a timeline of lanes. A clip is a section
+            // of a track (`offset` seconds in, `length` seconds long) placed
+            // on a lane at `start` seconds.
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE flows (
+                     id INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL,
+                     created_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE flow_clips (
+                     id INTEGER PRIMARY KEY,
+                     flow_id INTEGER NOT NULL REFERENCES flows (id) ON DELETE CASCADE,
+                     track_id INTEGER NOT NULL REFERENCES tracks (id) ON DELETE CASCADE,
+                     lane INTEGER NOT NULL,
+                     start REAL NOT NULL,
+                     offset REAL NOT NULL,
+                     length REAL NOT NULL
+                 );
+                 CREATE INDEX flow_clips_order ON flow_clips (flow_id, start);
+                 PRAGMA user_version = 4;
+                 COMMIT;",
+            )?;
+        }
+        if version < 5 {
+            // What structure analysis found: an energy level for the track,
+            // and cue points where its sections begin.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE tracks ADD COLUMN energy INTEGER;
+                 CREATE TABLE cues (
+                     track_id INTEGER NOT NULL REFERENCES tracks (id) ON DELETE CASCADE,
+                     position INTEGER NOT NULL,
+                     seconds REAL NOT NULL,
+                     energy INTEGER NOT NULL,
+                     PRIMARY KEY (track_id, position)
+                 );
+                 PRAGMA user_version = 5;
+                 COMMIT;",
+            )?;
+        }
+        if version < 6 {
+            // Cue points the user has edited are theirs: analysis leaves
+            // them alone from then on.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE tracks ADD COLUMN cues_manual INTEGER NOT NULL DEFAULT 0;
+                 PRAGMA user_version = 6;
+                 COMMIT;",
+            )?;
+        }
         Ok(Self { conn })
     }
 
@@ -266,6 +344,71 @@ impl Library {
             ],
         )?;
         Ok(())
+    }
+
+    /// Records what analysis found: a track's energy and cue points. Cue
+    /// points the user has edited are kept as they are.
+    pub fn store_structure(
+        &mut self,
+        id: i64,
+        energy: Option<u8>,
+        cues: &[CuePoint],
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tracks SET energy = ?2 WHERE id = ?1",
+            params![id, energy],
+        )?;
+        let edited: bool = self
+            .conn
+            .query_row(
+                "SELECT cues_manual FROM tracks WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if edited {
+            return Ok(());
+        }
+        self.replace_cues(id, cues)
+    }
+
+    /// Sets a track's cue points by hand. They are stored in time order, and
+    /// analysis will not replace them.
+    pub fn set_cues(&mut self, id: i64, cues: &[CuePoint]) -> Result<()> {
+        let mut cues = cues.to_vec();
+        cues.sort_by(|a, b| a.seconds.total_cmp(&b.seconds));
+        self.replace_cues(id, &cues)?;
+        self.conn
+            .execute("UPDATE tracks SET cues_manual = 1 WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    fn replace_cues(&mut self, id: i64, cues: &[CuePoint]) -> Result<()> {
+        let transaction = self.conn.transaction()?;
+        transaction.execute("DELETE FROM cues WHERE track_id = ?1", [id])?;
+        for (position, cue) in cues.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO cues (track_id, position, seconds, energy) VALUES (?1, ?2, ?3, ?4)",
+                params![id, position as i64, cue.seconds, cue.energy],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// A track's cue points, in order.
+    pub fn cues(&self, id: i64) -> Result<Vec<CuePoint>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT seconds, energy FROM cues WHERE track_id = ?1 ORDER BY position")?;
+        let cues = statement.query_map([id], |row| {
+            Ok(CuePoint {
+                seconds: row.get(0)?,
+                energy: row.get(1)?,
+            })
+        })?;
+        Ok(cues.collect::<rusqlite::Result<_>>()?)
     }
 
     /// The beat grid measured for a track: its tempo and first beat.
@@ -419,15 +562,17 @@ impl Library {
                     t.genre, t.duration,
                     CASE WHEN t.bpm_manual = 0 AND t.tempo_confidence >= ?3
                          THEN t.tempo_bpm ELSE t.bpm END,
-                    t.key
+                    t.key, t.energy, s.name, s.kind
              FROM tracks t JOIN sources s ON s.id = t.source_id
              LEFT JOIN playlist_tracks pt ON pt.track_id = t.id AND pt.playlist_id = ?2
-             WHERE (?1 IS NULL OR t.source_id = ?1) AND (?2 IS NULL OR pt.track_id IS NOT NULL)",
+             WHERE (?1 IS NULL OR t.source_id = ?1) AND (?2 IS NULL OR pt.track_id IS NOT NULL)
+               AND (?4 IS NULL OR t.id = ?4)",
         );
         let mut values: Vec<rusqlite::types::Value> = vec![
             query.source.into(),
             query.playlist.into(),
             MIN_TEMPO_CONFIDENCE.into(),
+            query.id.into(),
         ];
         for word in query.search.split_whitespace() {
             let escaped = word
@@ -462,9 +607,43 @@ impl Library {
                 duration_seconds: row.get(8)?,
                 bpm: row.get(9)?,
                 key: row.get(10)?,
+                camelot: None,
+                energy: row.get(11)?,
+                source_name: row.get(12)?,
+                source_kind: source_kind(&row.get::<_, String>(13)?),
             })
         })?;
-        Ok(tracks.collect::<rusqlite::Result<_>>()?)
+        let mut tracks: Vec<Track> = tracks.collect::<rusqlite::Result<_>>()?;
+        // Keys are spelled too many ways for the database to compare them.
+        for track in &mut tracks {
+            track.camelot = track.key.as_deref().and_then(Camelot::parse);
+        }
+        if !query.keys.is_empty() {
+            tracks.retain(|track| track.camelot.is_some_and(|key| query.keys.contains(&key)));
+        }
+        Ok(tracks)
+    }
+
+    /// How many tracks the library has in each key.
+    pub fn key_counts(&self) -> Result<HashMap<Camelot, usize>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT key FROM tracks WHERE key IS NOT NULL")?;
+        let keys = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut counts = HashMap::new();
+        for key in keys {
+            if let Some(key) = Camelot::parse(&key?) {
+                *counts.entry(key).or_insert(0) += 1;
+            }
+        }
+        Ok(counts)
+    }
+}
+
+fn source_kind(kind: &str) -> SourceKind {
+    match kind {
+        "files" => SourceKind::Files,
+        _ => SourceKind::Folder,
     }
 }
 
@@ -473,9 +652,6 @@ fn source_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Source> {
         id: row.get(0)?,
         name: row.get(1)?,
         location: row.get(2)?,
-        kind: match row.get::<_, String>(3)?.as_str() {
-            "files" => SourceKind::Files,
-            _ => SourceKind::Folder,
-        },
+        kind: source_kind(&row.get::<_, String>(3)?),
     })
 }

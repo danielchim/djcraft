@@ -1,11 +1,11 @@
-//! Prints the detected tempo of audio files.
+//! Prints the detected tempo, energy and cue points of audio files.
 //!
 //!     cargo run -p djcraft-analysis --example tempo -- <file>...
 
 use std::path::Path;
 use std::time::Instant;
 
-use djcraft_analysis::{TempoRange, detect_tempo};
+use djcraft_analysis::{TempoRange, detect_structure, detect_tempo};
 use djcraft_engine::Track;
 
 /// Tempo does not need treble, and a lower rate is quicker to decode.
@@ -22,7 +22,25 @@ fn main() {
             }
         };
         let decoded = started.elapsed();
-        match detect_tempo(&track.mono(), ANALYSIS_RATE, TempoRange::default()) {
+        let samples = track.mono();
+        let tempo = detect_tempo(&samples, ANALYSIS_RATE, TempoRange::default());
+        if let Some(structure) = detect_structure(&samples, ANALYSIS_RATE, tempo) {
+            let cues: Vec<String> = structure
+                .cues
+                .iter()
+                .map(|cue| {
+                    let seconds = cue.seconds.round() as u64;
+                    format!(
+                        "{}:{:02} (energy {})",
+                        seconds / 60,
+                        seconds % 60,
+                        cue.energy
+                    )
+                })
+                .collect();
+            println!("energy {}  cues {}", structure.energy, cues.join(", "));
+        }
+        match tempo {
             Some(tempo) => println!(
                 "{:7.2} BPM  first beat {:.3} s  confidence {:.2}  (decode {:.1?}, analyse {:.1?})  {}",
                 tempo.bpm,
