@@ -1,0 +1,28 @@
+# Licence allow-list. djcraft is MIT; nothing copyleft that would bind the
+# whole app (GPL, AGPL) may be linked in.
+[graph]
+all-features = true
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "ISC",
+    "Zlib",
+    "CC0-1.0",
+    "Unicode-3.0",
+    # File-level copyleft: changes to MPL files must be shared, but linking
+    # them into an MIT app is allowed. symphonia is MPL-2.0.
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

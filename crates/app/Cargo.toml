@@ -1,0 +1,11 @@
+[package]
+name = "djcraft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dirs = "7.0.0"
+djcraft-engine = { version = "0.1.0", path = "../engine" }
+djcraft-protocol = { version = "0.1.0", path = "../protocol" }
+gpui-kit.workspace = true

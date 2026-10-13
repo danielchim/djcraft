@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/app", "crates/engine", "crates/library", "crates/protocol"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+gpui-kit = "0.7.3"
+
+# Decoding and DSP are too slow to use unoptimised, even while developing.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev.package.djcraft-engine]
+opt-level = 3
