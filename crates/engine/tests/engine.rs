@@ -274,7 +274,8 @@ fn loads_a_file_and_resamples_it() {
         path: path.to_string_lossy().into_owned(),
     };
     engine.apply(Role::Host, deck(load)).unwrap();
-    assert!(engine.state().decks[0].loading);
+    // No check that it reads as loading here: a small file on a fast
+    // machine can be ready before the first look.
     wait_for_load(&mut engine);
     // The deck is handed the track before decoding has necessarily finished.
     let deadline = Instant::now() + Duration::from_secs(10);

@@ -533,7 +533,7 @@ impl Library {
     /// Registers a folder as a source, or returns the existing one. The
     /// folder is not read until [`Library::scan`] is called.
     pub fn add_folder(&self, folder: &Path) -> Result<Source> {
-        let folder = folder.canonicalize()?;
+        let folder = canonical(folder)?;
         let location = folder.to_string_lossy().into_owned();
         let name = folder
             .file_name()
@@ -660,6 +660,21 @@ impl Library {
         }
         Ok(counts)
     }
+}
+
+/// A path in its full, real form, as a path people and other software
+/// recognise. On Windows the system's own answer starts with `\\?\`, which
+/// most programs do not accept, so that prefix is dropped from drive paths.
+pub(crate) fn canonical(path: &Path) -> io::Result<PathBuf> {
+    let path = path.canonicalize()?;
+    let text = path.to_string_lossy();
+    let plain = text
+        .strip_prefix(r"\\?\")
+        .filter(|rest| rest.as_bytes().get(1) == Some(&b':'));
+    Ok(match plain {
+        Some(plain) => PathBuf::from(plain),
+        None => path,
+    })
 }
 
 fn source_kind(kind: &str) -> SourceKind {

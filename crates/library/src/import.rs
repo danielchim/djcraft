@@ -302,7 +302,7 @@ impl Library {
     /// of the library's folders belongs to that folder; any other file goes
     /// under the loose-files source. `None` if the file does not exist.
     fn track_for_file(&self, file: &Path, folders: &[crate::Source]) -> Result<Option<i64>> {
-        let Ok(file) = file.canonicalize() else {
+        let Ok(file) = crate::canonical(file) else {
             return Ok(None);
         };
         let Some(stamp) = file_stamp(&file).filter(|_| file.is_file()) else {

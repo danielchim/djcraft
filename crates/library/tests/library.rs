@@ -25,6 +25,17 @@ impl Drop for TempDir {
     }
 }
 
+/// A folder's real path in the form the library reports paths in: on
+/// Windows, without the `\\?\` prefix the system puts on them.
+fn real(path: &Path) -> PathBuf {
+    let path = path.canonicalize().unwrap();
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(plain) => PathBuf::from(plain),
+        None => path.clone(),
+    }
+}
+
 /// Writes one second of silence as a 16-bit mono WAV file.
 fn write_wav(path: &Path) {
     write_wav_of(path, 1);
@@ -118,7 +129,7 @@ fn scans_a_folder_and_reads_tags() {
     assert_eq!(closer.bpm, Some(132.5));
     assert_eq!(closer.key.as_deref(), Some("Am"));
     assert!((closer.duration_seconds - 1.0).abs() < 0.05);
-    assert_eq!(closer.path, dir.0.canonicalize().unwrap().join("sub/b.wav"));
+    assert_eq!(closer.path, real(&dir.0).join("sub/b.wav"));
     assert_eq!(tracks[0].bpm, None);
 }
 
@@ -381,10 +392,7 @@ fn imports_rekordbox_xml_playlists() {
         "120",
         "1A",
     );
-    let (music_dir, elsewhere_dir) = (
-        music.0.canonicalize().unwrap(),
-        elsewhere.0.canonicalize().unwrap(),
-    );
+    let (music_dir, elsewhere_dir) = (real(&music.0), real(&elsewhere.0));
     let xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <DJ_PLAYLISTS Version="1.0.0">
@@ -487,7 +495,7 @@ fn imports_a_virtualdj_folder() {
     let music = TempDir::new("vdj-music");
     write_tagged(&music.0.join("one.wav"), "One", "A", "", "120", "1A");
     write_tagged(&music.0.join("two & co.wav"), "Two", "B", "", "120", "1A");
-    let dir = music.0.canonicalize().unwrap();
+    let dir = real(&music.0);
 
     std::fs::create_dir_all(home.0.join("MyLists/Weddings")).unwrap();
     std::fs::create_dir_all(home.0.join("Playlists")).unwrap();
