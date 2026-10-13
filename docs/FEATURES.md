@@ -40,7 +40,8 @@ Status key: `[ ]` to do, `[~]` in progress, `[x]` done.
 
 ### Sources
 
-- [ ] Local files and folders, with watch-for-changes
+- [~] Local files and folders, with watch-for-changes (folders are scanned at
+      start-up and when added; no live watching yet)
 - [ ] Network shares
 - [ ] External sources as optional plugins (YouTube and similar through a
       user-installed `yt-dlp`); see Plugins
@@ -75,9 +76,12 @@ Feature set modelled on Mixed In Key 10.
 
 ### Tags
 
-- [ ] Read and write tags across MP3, FLAC, AAC, WAV, OGG
+- [~] Read and write tags across MP3, FLAC, AAC, WAV, OGG (title, artist,
+      album, genre, BPM and key, one track at a time from the info panel;
+      writing is tested on WAV only)
 - [ ] Audio fingerprint lookup (Chromaprint/AcoustID)
-- [ ] Metadata match from MusicBrainz and Discogs
+- [~] Metadata match from MusicBrainz and Discogs (MusicBrainz search by
+      artist and title from the info panel; no Discogs yet)
 - [ ] Review-and-diff screen before any tag is written
 - [ ] Batch tag alignment with undo
 - [ ] Choose where key and energy are written: key field, comment, grouping,
@@ -88,8 +92,10 @@ Feature set modelled on Mixed In Key 10.
 
 ### Organisation
 
-- [ ] Track browser with virtualised table, sorting, column chooser, search
-- [ ] Playlists and folders
+- [~] Track browser with virtualised table, sorting, column chooser, search
+      (no column chooser yet)
+- [~] Playlists and folders (create, delete, add and remove tracks; no
+      rename, reordering or folders in the UI yet)
 - [ ] Smart playlists (rule-based)
 - [ ] Auto-classification by genre, energy and era
 - [ ] Key/BPM compatibility hints for the next track
@@ -98,10 +104,14 @@ Feature set modelled on Mixed In Key 10.
 
 ### Interoperability
 
-- [ ] Import rekordbox XML
+- [~] Import rekordbox XML (playlists and their tracks; cues, grids, BPM and
+      key in the file are not read yet)
 - [ ] Import an existing rekordbox library database
 - [ ] Export rekordbox XML
 - [ ] Export to USB for Pioneer players
+- [~] Import VirtualDJ playlists (`.vdjfolder` and `.m3u`; written from the
+      documented format, not yet tried on a real VirtualDJ folder)
+- [x] Import M3U playlists
 - [ ] Serato and Traktor metadata import (later)
 
 ### Sync
@@ -283,6 +293,18 @@ sources need it first); each later milestone adds its own extension points.
 - [ ] Hot reload for plugin development
 - [ ] Plugin log and error view
 
+### Plugin store
+
+- [~] "+" button beside the library's source tabs that opens the plugins page
+      (page exists; nothing can be installed yet)
+- [ ] Open store index format: a list of plugins with name, version,
+      permissions, download link and checksum
+- [ ] Self-hostable store; subscribe to more than one store in the app
+- [ ] Browse and search plugins by kind (source, metadata, controller, …)
+- [ ] Install, update and remove from the store, with the permission prompt
+- [ ] Checksum verification on download, and signed listings
+- [ ] Source plugins appear as tabs beside Local in the library
+
 ### Extension points
 
 - [ ] Music sources: search, browse, resolve to a playable stream or file
@@ -311,8 +333,9 @@ waveforms, and options tucked into popovers.
 - [ ] Mode switcher: classic two-turntable view, 2-deck waveform view, 4-deck
       view, automix view, single-deck prep view
 - [ ] Horizontal and vertical waveform layouts
-- [ ] Library docked under the decks, expandable to full window, with a source
-      sidebar (local, playlists, external sources, radio)
+- [~] Library docked under the decks, expandable to full window, with a source
+      sidebar (local, playlists, external sources, radio) (folders and
+      playlists are there; not expandable yet)
 - [ ] Deck tool tabs under each deck: cues, loops, beat jump, slicer, keyboard,
       stems, FX
 - [ ] Popover panels for per-deck options: BPM, key, beat grid, EQ, crossfader

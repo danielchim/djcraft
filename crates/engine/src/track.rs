@@ -66,7 +66,12 @@ fn zeroed(len: usize) -> Box<[AtomicU32]> {
 
 impl Track {
     /// An empty track with room for `capacity` frames.
-    fn with_capacity(title: String, sample_rate: u32, estimated_frames: usize, capacity: usize) -> Self {
+    fn with_capacity(
+        title: String,
+        sample_rate: u32,
+        estimated_frames: usize,
+        capacity: usize,
+    ) -> Self {
         Self {
             title,
             sample_rate,
@@ -403,7 +408,10 @@ impl Converter {
     /// Resamples the first `valid` frames of one chunk taken from `pending`,
     /// appending the result to `out`.
     fn process(&mut self, valid: usize, out: &mut Vec<f32>) -> Result<(), DecodeError> {
-        let resampler = self.resampler.as_mut().expect("process without a resampler");
+        let resampler = self
+            .resampler
+            .as_mut()
+            .expect("process without a resampler");
         let chunk = resampler.input_frames_next();
         let output_frames = self.output.len() / CHANNELS;
         let input = InterleavedSlice::new(&self.pending[..chunk * CHANNELS], CHANNELS, chunk)

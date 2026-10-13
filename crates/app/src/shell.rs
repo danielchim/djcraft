@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use djcraft_engine::{Engine, MAX_TEMPO, MIN_TEMPO};
 use djcraft_protocol::{Action, DeckAction, DeckState, Role};
 use gpui_kit::assets::IconName;
@@ -9,6 +11,9 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::library_view::{LibraryEvent, LibraryView};
+use crate::settings::{Settings, StartTab, data_dir};
+use crate::settings_view::{SettingsEvent, SettingsView};
 use crate::waveform::waveform;
 
 const TOP_BAR_HEIGHT: Pixels = px(52.);
@@ -16,7 +21,7 @@ const MAX_B2B_DJS: usize = 4;
 const TEMPO_STEP: f64 = 0.01;
 
 #[derive(Clone, Copy, PartialEq)]
-enum Tab {
+pub enum Tab {
     Library,
     Live,
     Radio,
@@ -27,13 +32,26 @@ pub struct Shell {
     is_live: bool,
     /// DJs in the current back-to-back session, host first.
     djs: Vec<SharedString>,
+    library: Entity<LibraryView>,
+    /// The track browser under the decks.
+    browser: Entity<LibraryView>,
+    settings: Settings,
+    /// The settings dialog, while it is open.
+    settings_view: Option<Entity<SettingsView>>,
+    /// Set when the dialog has just opened and should take keyboard focus.
+    focus_settings: bool,
     engine: Option<Engine>,
     engine_error: Option<SharedString>,
 }
 
 impl Shell {
     /// Opens the audio engine and loads `tracks` onto the decks in order.
-    pub fn new(tracks: Vec<String>) -> Self {
+    pub fn new(
+        tracks: Vec<String>,
+        settings: Settings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let (engine, engine_error) = match Engine::new() {
             Ok(mut engine) => {
                 if let Some(dir) = dirs::cache_dir() {
@@ -43,10 +61,39 @@ impl Shell {
             }
             Err(error) => (None, Some(error.to_string().into())),
         };
+        let scan = settings.scan_on_startup;
+        let library = cx.new(|cx| LibraryView::new(false, scan, window, cx));
+        library.update(cx, |view, cx| view.set_provider(settings.info_provider, cx));
+        cx.subscribe(&library, |this, _, event: &LibraryEvent, cx| match event {
+            LibraryEvent::Load { path, deck } => {
+                this.load_from_library(path, *deck);
+                this.show(Tab::Live, cx);
+            }
+        })
+        .detach();
+        let browser = cx.new(|cx| LibraryView::new(true, false, window, cx));
+        cx.subscribe(&browser, |this, _, event: &LibraryEvent, cx| match event {
+            LibraryEvent::Load { path, deck } => {
+                this.load_from_library(path, *deck);
+                cx.notify();
+            }
+        })
+        .detach();
         let mut shell = Self {
-            tab: Tab::Live,
+            // Tracks named on the command line go to the decks, so show them.
+            tab: match settings.start_tab {
+                _ if !tracks.is_empty() => Tab::Live,
+                StartTab::Library => Tab::Library,
+                StartTab::Live => Tab::Live,
+                StartTab::Radio => Tab::Radio,
+            },
             is_live: false,
             djs: vec!["You".into()],
+            library,
+            browser,
+            settings,
+            settings_view: None,
+            focus_settings: false,
             engine,
             engine_error,
         };
@@ -54,6 +101,64 @@ impl Shell {
             shell.send(deck, DeckAction::Load { path });
         }
         shell
+    }
+
+    pub fn show(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        self.tab = tab;
+        // The two library views share a database; whichever is coming into
+        // view may be behind the other.
+        match tab {
+            Tab::Library => self.library.update(cx, |view, cx| view.refresh(cx)),
+            Tab::Live => self.browser.update(cx, |view, cx| view.refresh(cx)),
+            Tab::Radio => {}
+        }
+        cx.notify();
+    }
+
+    pub fn open_settings(&mut self, cx: &mut Context<Self>) {
+        if self.settings_view.is_some() {
+            return;
+        }
+        let audio: SharedString = match (&self.engine, &self.engine_error) {
+            (Some(engine), _) => format!("System default, {} Hz", engine.sample_rate()).into(),
+            (None, Some(error)) => error.clone(),
+            (None, None) => "Not available".into(),
+        };
+        let settings = self.settings.clone();
+        let view = cx.new(|cx| SettingsView::new(settings, audio, cx));
+        cx.subscribe(&view, |this, _, event: &SettingsEvent, cx| {
+            match event {
+                SettingsEvent::Changed(settings) => {
+                    this.settings = settings.clone();
+                    this.settings.apply_theme(cx);
+                    this.library
+                        .update(cx, |view, cx| view.set_provider(settings.info_provider, cx));
+                    if let Err(error) = this.settings.save(&data_dir()) {
+                        eprintln!("could not save settings: {error}");
+                    }
+                }
+                SettingsEvent::Closed => this.settings_view = None,
+            }
+            cx.notify();
+        })
+        .detach();
+        self.settings_view = Some(view);
+        self.focus_settings = true;
+        cx.notify();
+    }
+
+    /// Loads a library track. With no deck named, it goes to the first one
+    /// that is not playing; if every deck is playing, nothing is replaced.
+    fn load_from_library(&mut self, path: &Path, deck: Option<usize>) {
+        let Some(engine) = &mut self.engine else {
+            return;
+        };
+        let free = || engine.state().decks.iter().position(|deck| !deck.playing);
+        let Some(deck) = deck.or_else(free) else {
+            return;
+        };
+        let path = path.to_string_lossy().into_owned();
+        self.send(deck, DeckAction::Load { path });
     }
 
     /// Sends a deck action to the engine as the session host.
@@ -115,48 +220,46 @@ impl Shell {
                 )
             });
 
-        let right = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .when(live, |this| {
-                this.child(self.b2b(cx))
-                    .child(
-                        Button::new("share")
-                            .outline()
-                            .rounded(ButtonRounded::Size(px(999.)))
-                            .icon(IconName::Share2)
-                            .label("Share"),
-                    )
-                    .child(self.go_live(cx))
-                    .child(
-                        Button::new("deck-mode")
-                            .outline()
-                            .rounded(ButtonRounded::Size(px(999.)))
-                            .icon(IconName::Columns2)
-                            .label("Two Decks")
-                            .dropdown_caret(true),
-                    )
-            });
+        let right = div().flex().items_center().gap_2().when(live, |this| {
+            this.child(self.b2b(cx))
+                .child(
+                    Button::new("share")
+                        .outline()
+                        .rounded(ButtonRounded::Size(px(999.)))
+                        .icon(IconName::Share2)
+                        .label("Share"),
+                )
+                .child(self.go_live(cx))
+                .child(
+                    Button::new("deck-mode")
+                        .outline()
+                        .rounded(ButtonRounded::Size(px(999.)))
+                        .icon(IconName::Columns2)
+                        .label("Two Decks")
+                        .dropdown_caret(true),
+                )
+        });
+        let right = right.child(
+            self.tool("settings", IconName::Settings, "Settings")
+                .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx))),
+        );
 
-        TitleBar::new()
-            .h(TOP_BAR_HEIGHT)
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .items_center()
-                    .justify_between()
-                    .pr_3()
-                    .child(div().flex().flex_1().child(left))
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(FontWeight::BOLD)
-                            .child("djcraft"),
-                    )
-                    .child(div().flex().flex_1().justify_end().child(right)),
-            )
+        TitleBar::new().h(TOP_BAR_HEIGHT).child(
+            div()
+                .flex()
+                .flex_1()
+                .items_center()
+                .justify_between()
+                .pr_3()
+                .child(div().flex().flex_1().child(left))
+                .child(
+                    div()
+                        .text_lg()
+                        .font_weight(FontWeight::BOLD)
+                        .child("djcraft"),
+                )
+                .child(div().flex().flex_1().justify_end().child(right)),
+        )
     }
 
     fn b2b(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -170,15 +273,19 @@ impl Shell {
                     .children(self.djs.iter().map(|name| Avatar::new().name(name.clone()))),
             )
             .child(
-                self.tool("b2b-invite", IconName::UserPlus, "Invite a DJ to mix back-to-back")
-                    .disabled(full)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if this.djs.len() < MAX_B2B_DJS {
-                            let n = this.djs.len() + 1;
-                            this.djs.push(format!("DJ {n}").into());
-                            cx.notify();
-                        }
-                    })),
+                self.tool(
+                    "b2b-invite",
+                    IconName::UserPlus,
+                    "Invite a DJ to mix back-to-back",
+                )
+                .disabled(full)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if this.djs.len() < MAX_B2B_DJS {
+                        let n = this.djs.len() + 1;
+                        this.djs.push(format!("DJ {n}").into());
+                        cx.notify();
+                    }
+                })),
             )
     }
 
@@ -211,10 +318,7 @@ impl Shell {
             .icon(icon)
             .label(label)
             .selected(self.tab == tab)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.tab = tab;
-                cx.notify();
-            }))
+            .on_click(cx.listener(move |this, _, _, cx| this.show(tab, cx)))
     }
 
     fn bottom_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -227,7 +331,13 @@ impl Shell {
             .child(
                 self.pill(cx)
                     .h(px(44.))
-                    .child(self.tab_button(Tab::Library, "tab-library", IconName::Library, "Library", cx))
+                    .child(self.tab_button(
+                        Tab::Library,
+                        "tab-library",
+                        IconName::Library,
+                        "Library",
+                        cx,
+                    ))
                     .child(self.tab_button(Tab::Live, "tab-live", IconName::Disc3, "Live", cx))
                     .child(self.tab_button(Tab::Radio, "tab-radio", IconName::Radio, "Radio", cx)),
             )
@@ -395,7 +505,7 @@ impl Shell {
     fn content(&self, decks: &[DeckState], cx: &mut Context<Self>) -> Div {
         let body = div().flex().flex_col().flex_1().min_h_0().gap_3().p_3();
         match self.tab {
-            Tab::Library => body.child(self.panel("Library", cx)),
+            Tab::Library => body.child(self.library.clone()),
             Tab::Live => body
                 .when_some(self.engine_error.clone(), |this, error| {
                     this.child(div().text_color(cx.theme().danger).child(error))
@@ -409,7 +519,7 @@ impl Shell {
                             .collect::<Vec<_>>(),
                     ),
                 )
-                .child(self.panel("Track browser", cx)),
+                .child(div().flex().flex_1().min_h_0().child(self.browser.clone())),
             Tab::Radio => body.child(self.panel("Radio: live mixes from other DJs", cx)),
         }
     }
@@ -434,7 +544,14 @@ impl Render for Shell {
         if decks.iter().any(moving) {
             window.request_animation_frame();
         }
+        if std::mem::take(&mut self.focus_settings)
+            && let Some(view) = &self.settings_view
+        {
+            let handle = view.read(cx).focus_handle().clone();
+            window.focus(&handle, cx);
+        }
         div()
+            .relative()
             .size_full()
             .flex()
             .flex_col()
@@ -443,5 +560,6 @@ impl Render for Shell {
             .child(self.top_bar(cx))
             .child(self.content(&decks, cx))
             .child(self.bottom_tabs(cx))
+            .children(self.settings_view.clone())
     }
 }

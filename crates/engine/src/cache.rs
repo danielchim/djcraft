@@ -80,7 +80,9 @@ impl Entry {
             fs::create_dir_all(dir)?;
         }
         // Write to one side and rename, so a reader never sees half a file.
-        let partial = self.path.with_extension(format!("{}.partial", std::process::id()));
+        let partial = self
+            .path
+            .with_extension(format!("{}.partial", std::process::id()));
         fs::write(&partial, bytes)?;
         fs::rename(&partial, &self.path)
     }

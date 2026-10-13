@@ -60,7 +60,10 @@ pub fn waveform(
                 }
                 let x = (columns / 2) as f32 * COLUMN_WIDTH;
                 window.paint_quad(fill(
-                    Bounds::new(bounds.origin + point(px(x), px(0.)), size(px(2.), px(height))),
+                    Bounds::new(
+                        bounds.origin + point(px(x), px(0.)),
+                        size(px(2.), px(height)),
+                    ),
                     playhead,
                 ));
             });

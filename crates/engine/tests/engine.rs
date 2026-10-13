@@ -104,7 +104,9 @@ fn key_lock_changes_tempo_but_keeps_pitch() {
     assert!((2.2..=2.5).contains(&position), "position {position}");
     let pitch = frequency(&out[RATE as usize..]);
     assert!((pitch - 440.0).abs() < 5.0, "pitch {pitch}");
-    let peak = out[RATE as usize..].iter().fold(0f32, |p, s| p.max(s.abs()));
+    let peak = out[RATE as usize..]
+        .iter()
+        .fold(0f32, |p, s| p.max(s.abs()));
     assert!((0.4..=0.6).contains(&peak), "peak {peak}");
 }
 
@@ -180,7 +182,9 @@ fn volume_and_master_gain_scale_the_output() {
     engine.apply(Role::Host, deck(DeckAction::Play)).unwrap();
     let out = render(&mut mixer, 1.0);
 
-    let peak = out[RATE as usize / 2..].iter().fold(0f32, |p, s| p.max(s.abs()));
+    let peak = out[RATE as usize / 2..]
+        .iter()
+        .fold(0f32, |p, s| p.max(s.abs()));
     assert!((peak - 0.125).abs() < 0.005, "peak {peak}");
 }
 
@@ -216,7 +220,12 @@ fn rejects_actions_by_role_and_value() {
         Err(Rejection::InvalidValue)
     );
     assert_eq!(
-        engine.apply(Role::Host, deck(DeckAction::Scratch { speed: Some(f64::NAN) })),
+        engine.apply(
+            Role::Host,
+            deck(DeckAction::Scratch {
+                speed: Some(f64::NAN)
+            })
+        ),
         Err(Rejection::InvalidValue)
     );
 }
@@ -300,7 +309,13 @@ fn reports_a_failed_load() {
 
     let state = engine.state();
     assert!(state.decks[0].track.is_none());
-    assert!(state.decks[0].error.as_ref().unwrap().contains("cannot open file"));
+    assert!(
+        state.decks[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("cannot open file")
+    );
 }
 
 #[test]
@@ -324,7 +339,10 @@ fn a_track_is_playable_before_it_is_fully_decoded() {
     assert!(track.is_complete());
     assert_eq!(track.frames(), 10 * RATE as usize);
     assert_eq!(track.decoded_frames(), track.frames());
-    assert_eq!(track.peak_count(), track.frames().div_ceil(track.frames_per_peak()));
+    assert_eq!(
+        track.peak_count(),
+        track.frames().div_ceil(track.frames_per_peak())
+    );
 }
 
 #[test]
@@ -388,7 +406,12 @@ fn a_cached_waveform_is_complete_as_soon_as_the_track_opens() {
     .unwrap();
 
     // A damaged entry is ignored and replaced.
-    let entry = std::fs::read_dir(&cache).unwrap().next().unwrap().unwrap().path();
+    let entry = std::fs::read_dir(&cache)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
     std::fs::write(&entry, b"not a waveform").unwrap();
     let mut rebuilt = None;
     Track::load(&moved, RATE, Some(&cache), |track| {

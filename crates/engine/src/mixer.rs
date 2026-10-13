@@ -186,7 +186,12 @@ fn interpolate(track: &Track, frames: usize, position: f64) -> [f32; CHANNELS] {
             [track.sample(i), track.sample(i + 1)]
         }
     };
-    let (p0, p1, p2, p3) = (frame(index - 1), frame(index), frame(index + 1), frame(index + 2));
+    let (p0, p1, p2, p3) = (
+        frame(index - 1),
+        frame(index),
+        frame(index + 1),
+        frame(index + 2),
+    );
     let mut out = [0.0; CHANNELS];
     for c in 0..CHANNELS {
         let a = -0.5 * p0[c] + 1.5 * p1[c] - 1.5 * p2[c] + 0.5 * p3[c];

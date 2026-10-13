@@ -14,6 +14,8 @@ allow = [
     "Zlib",
     "CC0-1.0",
     "Unicode-3.0",
+    # Permissive licence for data; covers the bundled root certificates.
+    "CDLA-Permissive-2.0",
     # File-level copyleft: changes to MPL files must be shared, but linking
     # them into an MIT app is allowed. symphonia is MPL-2.0.
     "MPL-2.0",

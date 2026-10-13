@@ -45,19 +45,31 @@ pub enum Action {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum DeckAction {
     /// Load a track from a path on the host.
-    Load { path: String },
+    Load {
+        path: String,
+    },
     Play,
     Pause,
-    Seek { seconds: f64 },
+    Seek {
+        seconds: f64,
+    },
     /// Playback speed as a ratio of the original tempo; 1.0 is unchanged.
-    SetTempo { ratio: f64 },
+    SetTempo {
+        ratio: f64,
+    },
     /// Keep the original pitch when the tempo changes.
-    SetKeyLock { on: bool },
-    SetVolume { level: f32 },
+    SetKeyLock {
+        on: bool,
+    },
+    SetVolume {
+        level: f32,
+    },
     /// Drive playback from an external speed signal (jog wheel, timecode).
     /// `Some(speed)` overrides the transport, with 1.0 as normal forward
     /// speed and negative values as reverse. `None` hands control back.
-    Scratch { speed: Option<f64> },
+    Scratch {
+        speed: Option<f64>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -163,7 +175,10 @@ mod tests {
             json,
             r#"{"version":1,"seq":7,"action":{"target":"deck","deck":1,"action":{"op":"scratch","speed":-0.5}}}"#
         );
-        assert_eq!(serde_json::from_str::<ClientMessage>(&json).unwrap(), message);
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(&json).unwrap(),
+            message
+        );
     }
 
     #[test]
@@ -184,6 +199,9 @@ mod tests {
             },
         };
         let json = serde_json::to_string(&message).unwrap();
-        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), message);
+        assert_eq!(
+            serde_json::from_str::<ServerMessage>(&json).unwrap(),
+            message
+        );
     }
 }
