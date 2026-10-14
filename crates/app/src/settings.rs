@@ -117,6 +117,8 @@ pub struct Settings {
     /// The user's own AcoustID application key, for looking tracks up by
     /// their sound.
     pub acoustid_key: String,
+    /// The user's own Discogs personal access token.
+    pub discogs_token: String,
 }
 
 impl Global for Settings {}
@@ -178,6 +180,7 @@ impl Default for Settings {
             key_placement: Placement::KeyField,
             energy_placement: Placement::Comment,
             acoustid_key: String::new(),
+            discogs_token: String::new(),
         }
     }
 }
@@ -199,6 +202,7 @@ impl Settings {
     pub fn lookup_keys(&self) -> djcraft_library::lookup::Keys {
         djcraft_library::lookup::Keys {
             acoustid: self.acoustid_key.trim().to_string(),
+            discogs_token: self.discogs_token.trim().to_string(),
         }
     }
 
@@ -257,6 +261,7 @@ mod tests {
             key_placement: Placement::TitlePrefix,
             energy_placement: Placement::Grouping,
             acoustid_key: "key".into(),
+            discogs_token: "token".into(),
         };
         settings.save(&dir).unwrap();
         assert_eq!(Settings::load(&dir), settings);

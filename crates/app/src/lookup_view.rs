@@ -142,7 +142,7 @@ impl LookupView {
                 .background_spawn(async move {
                     match provider {
                         Provider::AcoustId => identify_by_sound(&path, &keys.acoustid),
-                        _ => lookup::search(provider, &artist, &title),
+                        _ => lookup::search(provider, &artist, &title, &keys),
                     }
                 })
                 .await;

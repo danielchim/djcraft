@@ -29,6 +29,9 @@ pub enum Provider {
     /// Apple's store catalogue. Clean album names and a genre for every
     /// track, but only music that Apple sells.
     Itunes,
+    /// The record collectors' database, strong on vinyl and club releases,
+    /// with detailed styles such as "Tech House". Needs a personal token.
+    Discogs,
     /// Identifies a track by its sound, whatever its tags say. Needs an
     /// application key, and is used with [`identify`] rather than
     /// [`search`].
@@ -37,12 +40,13 @@ pub enum Provider {
 
 impl Provider {
     /// Those that search by artist and title.
-    pub const ALL: [Provider; 2] = [Provider::MusicBrainz, Provider::Itunes];
+    pub const ALL: [Provider; 3] = [Provider::MusicBrainz, Provider::Itunes, Provider::Discogs];
 
     pub fn label(self) -> &'static str {
         match self {
             Provider::MusicBrainz => "MusicBrainz",
             Provider::Itunes => "iTunes Store",
+            Provider::Discogs => "Discogs",
             Provider::AcoustId => "AcoustID (by sound)",
         }
     }
@@ -56,7 +60,12 @@ impl Provider {
 /// [`search_terms`]), retrying without the artist if that finds nothing, and
 /// the results are ranked by how well they match the text as given, mix
 /// name included. Makes one to three network requests.
-pub fn search(provider: Provider, artist: &str, title: &str) -> Result<Vec<TrackMatch>> {
+pub fn search(
+    provider: Provider,
+    artist: &str,
+    title: &str,
+    keys: &Keys,
+) -> Result<Vec<TrackMatch>> {
     let (wanted_artist, wanted_title) = split_artist(artist, title);
     let (query_artist, query_title) = search_terms(artist, title);
     if query_title.is_empty() {
@@ -64,9 +73,15 @@ pub fn search(provider: Provider, artist: &str, title: &str) -> Result<Vec<Track
             "nothing to search for: the track has no title".into(),
         ));
     }
+    if provider == Provider::Discogs && keys.discogs_token.trim().is_empty() {
+        return Err(Error::Lookup(
+            "Discogs needs a personal token. Add one in Settings, Library.".into(),
+        ));
+    }
     let find = |artist: &str| match provider {
         Provider::MusicBrainz => musicbrainz(artist, &query_title),
         Provider::Itunes => itunes(artist, &query_title),
+        Provider::Discogs => discogs(artist, &query_title, keys.discogs_token.trim()),
         Provider::AcoustId => Err(Error::Lookup(
             "AcoustID identifies tracks by their sound, not by name.".into(),
         )),
@@ -88,6 +103,8 @@ pub fn search(provider: Provider, artist: &str, title: &str) -> Result<Vec<Track
 pub struct Keys {
     /// An AcoustID application key, from acoustid.org.
     pub acoustid: String,
+    /// A Discogs personal access token, from discogs.com/settings/developers.
+    pub discogs_token: String,
 }
 
 /// Identifies a track from its acoustic fingerprint (as made by
@@ -214,6 +231,86 @@ fn parse_acoustid(body: &str) -> Result<Vec<TrackMatch>> {
     });
     found.truncate(MAX_MATCHES);
     Ok(found)
+}
+
+#[derive(Deserialize)]
+struct DiscogsResponse {
+    #[serde(default)]
+    results: Vec<DiscogsRelease>,
+}
+
+#[derive(Deserialize)]
+struct DiscogsRelease {
+    /// "Artist - Release title".
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    year: Option<serde_json::Value>,
+    #[serde(default)]
+    genre: Vec<String>,
+    #[serde(default)]
+    style: Vec<String>,
+}
+
+const DISCOGS_FETCHED: usize = 25;
+
+fn discogs(artist: &str, title: &str, token: &str) -> Result<Vec<TrackMatch>> {
+    let body = get(Provider::Discogs, || {
+        let request = agent_request("https://api.discogs.com/database/search")
+            .header("Authorization", format!("Discogs token={token}"))
+            .query("type", "release")
+            .query("track", title)
+            .query("per_page", DISCOGS_FETCHED.to_string());
+        if artist.is_empty() {
+            request
+        } else {
+            request.query("artist", artist)
+        }
+    })?;
+    parse_discogs(&body, title)
+}
+
+/// Discogs finds releases, not tracks, so each match takes the track's title
+/// from the search and the rest from the release that has it.
+fn parse_discogs(body: &str, title: &str) -> Result<Vec<TrackMatch>> {
+    let response: DiscogsResponse = serde_json::from_str(body)
+        .map_err(|e| Error::Lookup(format!("Discogs reply was not understood: {e}")))?;
+    Ok(response
+        .results
+        .into_iter()
+        .filter_map(|release| {
+            let (artist, album) = release.title.split_once(" - ")?;
+            // Discogs numbers artists that share a name: "Fisher (5)".
+            let artist = match artist.trim().rsplit_once(" (") {
+                Some((name, number))
+                    if number
+                        .trim_end_matches(')')
+                        .chars()
+                        .all(|c| c.is_ascii_digit()) =>
+                {
+                    name.to_string()
+                }
+                _ => artist.trim().to_string(),
+            };
+            let year = release.year.and_then(|year| match year {
+                serde_json::Value::String(year) => year_of(&year),
+                serde_json::Value::Number(year) => Some(year.to_string()),
+                _ => None,
+            });
+            Some(TrackMatch {
+                title: title.to_string(),
+                compilation: artist == "Various",
+                artist,
+                album: album.trim().to_string(),
+                year,
+                // A style says more to a DJ than a genre: "Tech House" rather
+                // than "Electronic".
+                genre: release.style.into_iter().chain(release.genre).next(),
+                score: 0,
+                provider: Provider::Discogs,
+            })
+        })
+        .collect())
 }
 
 /// The artist and title to search for, tidied from what a file's tags say:
@@ -766,8 +863,10 @@ mod tests {
             ("Prince", "Purple Rain (Part 2)")
         );
         assert_eq!(terms("Simon & Garfunkel", "Mrs. Robinson").0, "Simon");
-        assert!(search(Provider::Itunes, "Someone", " ").is_err());
-        // A provider that needs a key says so before asking anything online.
+        assert!(search(Provider::Itunes, "Someone", " ", &Keys::default()).is_err());
+        // Providers that need a key say so before asking anything online.
+        let error = search(Provider::Discogs, "Fisher", "Losing It", &Keys::default());
+        assert!(error.unwrap_err().to_string().contains("Settings"));
         assert!(identify("", "AQAA", 120).is_err());
     }
 
@@ -901,6 +1000,26 @@ mod tests {
                 .to_string()
                 .contains("invalid API key")
         );
+    }
+
+    #[test]
+    fn reads_a_discogs_reply() {
+        let body = r#"{"pagination":{},"results":[
+            {"title":"Fisher (5) - Losing It","year":"2018","genre":["Electronic"],
+             "style":["Tech House"],"format":["Vinyl"]},
+            {"title":"Various - Defected Ibiza 2019","year":2019,"genre":["Electronic"],"style":[]},
+            {"title":"No separator here"}
+        ]}"#;
+        let found = parse_discogs(body, "Losing It").unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].artist, "Fisher");
+        assert_eq!(found[0].album, "Losing It");
+        assert_eq!(found[0].year.as_deref(), Some("2018"));
+        assert_eq!(found[0].genre.as_deref(), Some("Tech House"));
+        assert_eq!(found[0].title, "Losing It");
+        assert!(found[1].compilation);
+        assert_eq!(found[1].year.as_deref(), Some("2019"));
+        assert_eq!(found[1].genre.as_deref(), Some("Electronic"));
     }
 
     #[test]

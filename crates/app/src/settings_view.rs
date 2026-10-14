@@ -96,9 +96,9 @@ pub struct SettingsView {
     /// A description of the audio output in use.
     audio: SharedString,
     focus: FocusHandle,
-    /// A text box for the AcoustID key, made on first draw, as making it
-    /// needs the window.
-    key_inputs: Option<[Entity<InputState>; 1]>,
+    /// Text boxes for the AcoustID key and the Discogs token, made on first
+    /// draw, as making them needs the window.
+    key_inputs: Option<[Entity<InputState>; 2]>,
 }
 
 impl SettingsView {
@@ -112,13 +112,16 @@ impl SettingsView {
         }
     }
 
-    /// Makes the key text box, filled in from the settings, and saves what
-    /// is typed into it.
+    /// Makes the key and token text boxes, filled in from the settings, and
+    /// saves what is typed into them.
     fn make_key_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.key_inputs.is_some() {
             return;
         }
-        let values = [self.settings.acoustid_key.clone()];
+        let values = [
+            self.settings.acoustid_key.clone(),
+            self.settings.discogs_token.clone(),
+        ];
         let inputs = values.map(|value| {
             cx.new(|cx| {
                 let mut input = InputState::new(window, cx).placeholder("Not set");
@@ -130,8 +133,13 @@ impl SettingsView {
             cx.subscribe(input, move |this, input, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     let value = input.read(cx).value().trim().to_string();
-                    let _ = slot;
-                    this.change(|settings| settings.acoustid_key = value, cx);
+                    this.change(
+                        |settings| match slot {
+                            0 => settings.acoustid_key = value,
+                            _ => settings.discogs_token = value,
+                        },
+                        cx,
+                    );
                 }
             })
             .detach();
@@ -474,7 +482,7 @@ impl SettingsView {
                     vec![
                         self.row(
                             "Look up tracks with",
-                            "The online database Look up searches first. MusicBrainz covers more releases; the iTunes Store gives cleaner albums and a genre. You can switch in the Look up window.",
+                            "The online database Look up searches first. MusicBrainz covers more releases; the iTunes Store gives cleaner albums and a genre; Discogs is strong on vinyl and club styles. You can switch in the Look up window.",
                             provider,
                             cx,
                         ),
@@ -482,6 +490,12 @@ impl SettingsView {
                             "AcoustID key",
                             "Identifies a track by its sound when its tags are wrong or missing. Get a free application key at acoustid.org/new-application and paste it here.",
                             key_box(0),
+                            cx,
+                        ),
+                        self.row(
+                            "Discogs token",
+                            "Lets Look up search Discogs. Make a personal access token at discogs.com/settings/developers and paste it here. It is stored in djcraft's settings file.",
+                            key_box(1),
                             cx,
                         ),
                     ],
