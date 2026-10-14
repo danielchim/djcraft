@@ -17,10 +17,14 @@ is the full plan, with the status of every item.
   AIFF, M4A, OGG and Opus files.
 - **Playlists:** create playlists that mix tracks from any folder, and import
   them from a rekordbox XML export, a VirtualDJ folder, or M3U files.
-- **Track info:** view a track's details and cover art, edit them (changes are
-  written to the file's tags), and look them up on MusicBrainz or the iTunes
-  Store. The lookup opens a popup that lists the matches, best first, and
-  lets you choose which details to copy.
+- **Track info:** view a track's details and cover art, edit them, and look
+  them up on MusicBrainz, the iTunes Store or Discogs, or by their sound
+  with AcoustID. The lookup opens a popup that lists the matches, best
+  first, and lets you choose which details to copy.
+- **Tag tools:** write the analysed BPM, key and energy into the tags, find
+  and replace, remove extra spaces, fix capitalisation, and rename files
+  from their tags. Every change to a file, including Save in the info panel,
+  is shown for review first, and any batch can be undone.
 - **Decks:** two decks with tempo control and key lock. Each deck shows a
   scrolling waveform with the beat grid and bar lines, and a whole-track
   waveform that you click to jump. Tracks become playable within a second
@@ -34,7 +38,8 @@ is the full plan, with the status of every item.
   show, and whether the tempo and key in a file's tags are kept over the
   measured ones.
 - **Settings:** theme, start-up tab, start-up scanning, folder watching,
-  analysis and lookup provider.
+  analysis, where key and energy are written, the lookup provider, and your
+  own AcoustID key and Discogs token.
 
 The Radio tab, live broadcasting, remote sessions, effects, the mixer and plugins are planned but not built.
 

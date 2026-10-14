@@ -44,8 +44,10 @@ alone.
 - **Schema changes are migrations.** The library database has a version
   (`PRAGMA user_version`). Add a new step in `Library::init`. Never edit an
   existing one.
-- **The user's files.** Scanning and importing only read. The one place that
-  writes to music files is `Library::edit_track`, on an explicit Save.
+- **The user's files.** Scanning and importing only read. Music files are
+  written only in `crates/library/src/tags.rs`. The app plans each change
+  and shows it to the user for review. Then it calls
+  `Library::apply_changes`, which records the old values for undo.
 - **Keep `docs/FEATURES.md` current.** Mark items `[~]` or `[x]` as they land,
   and say in brackets what is still missing.
 - **Tests.** Engine and library behaviour is tested without an audio device
