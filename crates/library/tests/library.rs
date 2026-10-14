@@ -163,15 +163,16 @@ fn rescan_picks_up_changes_only() {
             added: 1,
             updated: 1,
             unchanged: 0,
-            removed: 1
+            removed: 1,
+            relinked: 0,
         }
     );
-    assert_eq!(titles(&library, ""), ["c", "Two (Remix)"]);
+    // The track whose file went stays, marked missing.
+    assert_eq!(titles(&library, ""), ["c", "One", "Two (Remix)"]);
+    let tracks = library.tracks(&TrackQuery::default()).unwrap();
+    assert!(tracks[1].missing && !tracks[2].missing);
     // A re-read file keeps its identity, so playlists can keep pointing at it.
-    assert_eq!(
-        library.tracks(&TrackQuery::default()).unwrap()[1].id,
-        id_of_two
-    );
+    assert_eq!(tracks[2].id, id_of_two);
 }
 
 #[test]
@@ -399,6 +400,7 @@ fn an_existing_library_gains_playlists_on_upgrade() {
     raw.execute_batch(
         "ALTER TABLE tracks DROP COLUMN year;
          ALTER TABLE tracks DROP COLUMN year_checked;
+         ALTER TABLE tracks DROP COLUMN missing;
          DROP TABLE tag_history; DROP TABLE tag_batches;
          DROP TABLE playlist_tracks; DROP TABLE playlists;
          DROP TABLE options;
@@ -1167,6 +1169,99 @@ fn tags_are_written_and_read_back_in_every_format() {
         assert_eq!(track.artist, "Artist Ü");
         assert_eq!(track.camelot, Camelot::parse("8A"), "{}", track.title);
     }
+}
+
+#[test]
+fn missing_files_are_kept_followed_and_found_again() {
+    let dir = TempDir::new("missing");
+    std::fs::create_dir_all(dir.0.join("old")).unwrap();
+    std::fs::create_dir_all(dir.0.join("new")).unwrap();
+    write_tagged(&dir.0.join("old").join("a.wav"), "Alpha", "A", "", "", "");
+    write_wav_of(&dir.0.join("b.wav"), 2);
+    let elsewhere = TempDir::new("missing-elsewhere");
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let id_of = |library: &Library, title: &str| {
+        library
+            .tracks(&TrackQuery::default())
+            .unwrap()
+            .into_iter()
+            .find(|t| t.title == title)
+            .unwrap()
+    };
+    let alpha = id_of(&library, "Alpha");
+    library
+        .store_tempo(
+            alpha.id,
+            7,
+            Some(TempoResult {
+                bpm: 124.0,
+                first_beat_seconds: 0.0,
+                downbeat: 0,
+                confidence: 0.9,
+            }),
+        )
+        .unwrap();
+    let playlist = library.create_playlist("Set").unwrap();
+    library.add_to_playlist(playlist.id, &[alpha.id]).unwrap();
+
+    // A file moved within the folder is followed: same track, same analysis.
+    std::fs::rename(
+        dir.0.join("old").join("a.wav"),
+        dir.0.join("new").join("a.wav"),
+    )
+    .unwrap();
+    let summary = library.scan(source.id, |_| {}).unwrap();
+    assert_eq!(
+        (summary.relinked, summary.added, summary.removed),
+        (1, 0, 0)
+    );
+    let moved = id_of(&library, "Alpha");
+    assert_eq!(moved.id, alpha.id);
+    assert!(moved.path.ends_with("new/a.wav"));
+    let pending = library.pending_tempo_analysis(7).unwrap();
+    assert!(pending.iter().all(|(id, _)| *id != alpha.id));
+
+    // A file moved out of the library is missing, but keeps its playlist.
+    std::fs::rename(dir.0.join("new").join("a.wav"), elsewhere.0.join("a.wav")).unwrap();
+    std::fs::rename(dir.0.join("b.wav"), elsewhere.0.join("b.wav")).unwrap();
+    let summary = library.scan(source.id, |_| {}).unwrap();
+    assert_eq!(summary.removed, 2);
+    let missing = TrackQuery {
+        group: Some(Group::Missing),
+        ..Default::default()
+    };
+    assert_eq!(library.tracks(&missing).unwrap().len(), 2);
+    let in_set = TrackQuery {
+        playlist: Some(playlist.id),
+        ..Default::default()
+    };
+    assert_eq!(library.tracks(&in_set).unwrap().len(), 1);
+
+    // Searching a folder finds them by name and size; relocating relinks.
+    let found = library.find_moved(&elsewhere.0).unwrap();
+    assert_eq!(found.len(), 2);
+    for (track, path) in &found {
+        library.relocate(track.id, path).unwrap();
+    }
+    assert!(library.tracks(&missing).unwrap().is_empty());
+    let relocated = id_of(&library, "Alpha");
+    assert_eq!(relocated.id, alpha.id);
+    assert_eq!(relocated.source_name, "Imported files");
+    assert_eq!(library.tracks(&in_set).unwrap()[0].id, alpha.id);
+
+    // Missing tracks can be removed for good.
+    std::fs::remove_file(elsewhere.0.join("b.wav")).unwrap();
+    let loose = library
+        .sources()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind == SourceKind::Files)
+        .unwrap();
+    library.scan(loose.id, |_| {}).unwrap();
+    assert_eq!(library.remove_missing().unwrap(), 1);
+    assert_eq!(titles(&library, ""), ["Alpha"]);
 }
 
 #[test]

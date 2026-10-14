@@ -27,6 +27,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::lookup_view::{LookupEvent, LookupField, LookupView};
+use crate::organise_view::{OrganiseEvent, RelocateView};
 use crate::tag_tools::{FormEvent, RenameForm, ReplaceForm, ReviewEvent, ReviewView};
 
 /// How often the track list is refreshed while a scan is running.
@@ -478,6 +479,11 @@ impl TableDelegate for TrackTable {
         let mut menu = menu
             .item(item("Load to Deck 1".into(), LibraryView::load_to_deck, 0))
             .item(item("Load to Deck 2".into(), LibraryView::load_to_deck, 1));
+        if track.missing {
+            menu = menu
+                .separator()
+                .item(item("Locate file…".into(), LibraryView::locate_file, 0));
+        }
         if let Some(playlist) = self.playlist {
             menu = menu.separator().item(item(
                 "Remove from playlist".into(),
@@ -566,7 +572,16 @@ impl TableDelegate for TrackTable {
                 format!("{}:{:02}", seconds / 60, seconds % 60).into()
             }
         };
-        div().truncate().child(text)
+        // A track whose file is missing is shown faded, with a mark.
+        let missing = track.missing;
+        let text: SharedString = match self.field(col_ix) {
+            Field::Title if missing => format!("⚠ {text}").into(),
+            _ => text,
+        };
+        div()
+            .truncate()
+            .when(missing, |this| this.opacity(0.5))
+            .child(text)
     }
 }
 
@@ -1343,7 +1358,7 @@ impl LibraryView {
         Button::new("tag-tools")
             .outline()
             .icon(IconName::Tags)
-            .label("Tag tools")
+            .label("Tools")
             .dropdown_caret(true)
             .dropdown_menu(move |menu, _, _| {
                 let item = |label: String, run: fn(&mut LibraryView, &mut Window, &mut Context<LibraryView>)| {
@@ -1353,7 +1368,7 @@ impl LibraryView {
                     })
                 };
                 let mut menu = menu
-                    .label("Applies to every track in the list")
+                    .label("Tags of every track in the list")
                     .item(item("Write BPM, key and energy…".into(), |this, window, cx| {
                         let settings = cx
                             .try_global::<crate::settings::Settings>()
@@ -1400,7 +1415,11 @@ impl LibraryView {
                         .separator()
                         .item(item(undo, |this, window, cx| this.undo_last(window, cx)));
                 }
-                menu
+                menu.separator()
+                    .label("Library")
+                    .item(item("Find missing files in a folder…".into(), |this, window, cx| {
+                        this.find_moved(window, cx)
+                    }))
             })
     }
 
@@ -1667,6 +1686,164 @@ impl LibraryView {
         self.selected = None;
         self.group = Some(group);
         self.reload(cx);
+    }
+
+    /// Runs a change to the library, showing any error, then reloads.
+    fn change_library(
+        &mut self,
+        change: impl FnOnce(&mut Library) -> djcraft_library::Result<()>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(library) = &mut self.library else {
+            return;
+        };
+        if let Err(error) = change(library) {
+            self.error = Some(error.to_string().into());
+        }
+        self.reload(cx);
+        cx.emit(LibraryEvent::Changed);
+    }
+
+    /// Asks for a folder, looks there for the files of missing tracks, and
+    /// offers to relink those it finds.
+    fn find_moved(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let folder = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Search here".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(folder))) = folder.await else {
+                return;
+            };
+            let Some(folder) = folder.into_iter().next() else {
+                return;
+            };
+            this.update_in(cx, |this, window, cx| {
+                let Some(library) = &this.library else {
+                    return;
+                };
+                match library.find_moved(&folder) {
+                    Ok(found) if found.is_empty() => {
+                        this.notice = Some("None of the missing files are in that folder.".into());
+                        cx.notify();
+                    }
+                    Ok(found) => this.confirm_relocate(found, window, cx),
+                    Err(error) => {
+                        this.error = Some(error.to_string().into());
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn confirm_relocate(
+        &mut self,
+        found: Vec<(Track, PathBuf)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.new(|_| RelocateView::new(found));
+        cx.subscribe_in(
+            &view,
+            window,
+            |this, _, event: &OrganiseEvent, window, cx| {
+                if let OrganiseEvent::Relocate(moves) = event {
+                    let moves = moves.clone();
+                    let count = moves.len();
+                    this.change_library(
+                        |library| {
+                            for (id, path) in &moves {
+                                library.relocate(*id, path)?;
+                            }
+                            Ok(())
+                        },
+                        cx,
+                    );
+                    this.notice = Some(format!("Relinked {count} tracks.").into());
+                }
+                window.close_dialog(cx);
+            },
+        )
+        .detach();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("Missing files found")
+                .w(px(760.))
+                .child(view.clone())
+        });
+    }
+
+    /// Asks for the file of one missing track and relinks it.
+    fn locate_file(&mut self, track: i64, _: i64, cx: &mut Context<Self>) {
+        let file = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Use this file".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(file))) = file.await else {
+                return;
+            };
+            let Some(file) = file.into_iter().next() else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.change_library(|library| library.relocate(track, &file), cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Takes every missing track out of the library, after asking.
+    fn remove_missing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self
+            .groups
+            .iter()
+            .find(|group| group.group == Group::Missing)
+            .map_or(0, |group| group.count);
+        let view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let view = view.clone();
+            dialog
+                .title("Remove missing tracks?")
+                .w(px(460.))
+                .child(div().text_sm().child(format!(
+                    "{count} tracks whose files are missing will leave the library, with their places in playlists and their cue points. No file is touched."
+                )))
+                .footer(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("keep-missing")
+                                .outline()
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("remove-missing")
+                                .danger()
+                                .label(format!("Remove {count} tracks"))
+                                .on_click(move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.change_library(|library| library.remove_missing().map(|_| ()), cx);
+                                        view.group = None;
+                                        view.reload(cx);
+                                    })
+                                    .ok();
+                                    window.close_dialog(cx);
+                                }),
+                        ),
+                )
+        });
     }
 
     fn open_playlist(&mut self, playlist: i64, cx: &mut Context<Self>) {
@@ -2090,6 +2267,7 @@ impl LibraryView {
                         Group::Genre(_) => IconName::Tag,
                         Group::Energy(_) => IconName::Zap,
                         Group::Decade(_) => IconName::Calendar,
+                        Group::Missing => IconName::FileSearch,
                     };
                     div()
                         .id(("group", index))
@@ -2553,6 +2731,34 @@ impl LibraryView {
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
                             .child(status),
+                    )
+                    .when(
+                        self.group == Some(Group::Missing) && !self.compact,
+                        |this| {
+                            this.child(
+                                Button::new("find-moved")
+                                    .outline()
+                                    .small()
+                                    .icon(IconName::FileSearch)
+                                    .label("Find in a folder…")
+                                    .tooltip(
+                                        "Look for the missing files in a folder and relink them",
+                                    )
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.find_moved(window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("remove-missing-tracks")
+                                    .outline()
+                                    .small()
+                                    .icon(IconName::Trash)
+                                    .label("Remove all")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.remove_missing(window, cx)
+                                    })),
+                            )
+                        },
                     )
                     .when(!self.compact, |this| this.child(self.tag_tools_button(cx)))
                     .when(self.wheel_in_browser, |this| {

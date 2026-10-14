@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,7 +27,11 @@ pub struct ScanSummary {
     pub added: usize,
     pub updated: usize,
     pub unchanged: usize,
+    /// Tracks whose files are gone. They stay in the library, marked
+    /// missing, until they are found again or removed.
     pub removed: usize,
+    /// Tracks whose files had moved within the folder, and were followed.
+    pub relinked: usize,
 }
 
 struct Tags {
@@ -194,7 +198,7 @@ pub(crate) fn store_track(
              album = excluded.album, genre = excluded.genre,
              duration = excluded.duration, bpm = excluded.bpm, key = excluded.key,
              file_size = excluded.file_size, modified_at = excluded.modified_at,
-             year = excluded.year, year_checked = 1,
+             year = excluded.year, year_checked = 1, missing = 0,
              tempo_version = NULL",
         params![
             source_id,
@@ -216,9 +220,11 @@ pub(crate) fn store_track(
 }
 
 impl Library {
-    /// Brings a source up to date with what is on disk: new files are added,
-    /// changed files re-read, and missing files removed. Files whose size
-    /// and modification time are unchanged are not opened.
+    /// Brings a source up to date with what is on disk: new files are added
+    /// and changed files re-read. A file that moved within the folder (the
+    /// same name and size, somewhere else) keeps its track; one that is gone
+    /// leaves its track marked missing. Files whose size and modification
+    /// time are unchanged are not opened.
     pub fn scan(
         &mut self,
         source_id: i64,
@@ -231,10 +237,11 @@ impl Library {
             id: i64,
             stamp: (i64, i64),
             year_checked: bool,
+            missing: bool,
         }
         let mut known: HashMap<String, Known> = {
             let mut statement = self.conn.prepare(
-                "SELECT locator, id, file_size, modified_at, year_checked
+                "SELECT locator, id, file_size, modified_at, year_checked, missing
                  FROM tracks WHERE source_id = ?1",
             )?;
             let rows = statement.query_map([source_id], |row| {
@@ -244,6 +251,7 @@ impl Library {
                         id: row.get(1)?,
                         stamp: (row.get(2)?, row.get(3)?),
                         year_checked: row.get(4)?,
+                        missing: row.get(5)?,
                     },
                 ))
             })?;
@@ -275,6 +283,16 @@ impl Library {
         }
         files.sort();
 
+        // Tracks whose files are not where they were, by file name and size,
+        // so that a file that turns up elsewhere can be matched to one.
+        let present: HashSet<&str> = files.iter().map(|(locator, _)| locator.as_str()).collect();
+        let mut gone: HashMap<(String, i64), i64> = known
+            .iter()
+            .filter(|(locator, _)| !present.contains(locator.as_str()))
+            .map(|(locator, track)| ((file_name(locator), track.stamp.0), track.id))
+            .collect();
+        drop(present);
+
         let mut summary = ScanSummary::default();
         let total = files.len();
         for (batch_index, batch) in files.chunks(BATCH).enumerate() {
@@ -283,24 +301,59 @@ impl Library {
                 let Some(stamp) = file_stamp(path) else {
                     continue;
                 };
-                let previous = known.remove(locator);
-                if let Some(track) = previous.as_ref().filter(|track| track.stamp == stamp) {
-                    // Libraries from before years were read get them
-                    // without the file counting as changed.
-                    if !track.year_checked {
-                        transaction.execute(
-                            "UPDATE tracks SET year = ?2, year_checked = 1 WHERE id = ?1",
-                            params![track.id, read_tags(path).year],
-                        )?;
+                match known.remove(locator) {
+                    Some(track) if track.stamp == stamp => {
+                        if track.missing {
+                            transaction.execute(
+                                "UPDATE tracks SET missing = 0 WHERE id = ?1",
+                                [track.id],
+                            )?;
+                        }
+                        // Libraries from before years were read get them
+                        // without the file counting as changed.
+                        if !track.year_checked {
+                            transaction.execute(
+                                "UPDATE tracks SET year = ?2, year_checked = 1 WHERE id = ?1",
+                                params![track.id, read_tags(path).year],
+                            )?;
+                        }
+                        summary.unchanged += 1;
                     }
-                    summary.unchanged += 1;
-                    continue;
-                }
-                store_track(&transaction, source_id, locator, path, stamp)?;
-                if previous.is_some() {
-                    summary.updated += 1;
-                } else {
-                    summary.added += 1;
+                    Some(_) => {
+                        store_track(&transaction, source_id, locator, path, stamp)?;
+                        summary.updated += 1;
+                    }
+                    None => {
+                        let moved = gone.remove(&(file_name(locator), stamp.0));
+                        if let Some(id) = moved {
+                            // The track follows its file, keeping its id,
+                            // playlists, cue points and analysis.
+                            transaction.execute(
+                                "UPDATE tracks SET locator = ?2, missing = 0 WHERE id = ?1",
+                                params![id, locator],
+                            )?;
+                            known.retain(|_, track| track.id != id);
+                            summary.relinked += 1;
+                        } else {
+                            summary.added += 1;
+                        }
+                        let tempo_version: Option<Option<i64>> = match moved {
+                            Some(id) => Some(transaction.query_row(
+                                "SELECT tempo_version FROM tracks WHERE id = ?1",
+                                [id],
+                                |row| row.get(0),
+                            )?),
+                            None => None,
+                        };
+                        store_track(&transaction, source_id, locator, path, stamp)?;
+                        // A moved file is the same audio: no new analysis.
+                        if let (Some(id), Some(version)) = (moved, tempo_version) {
+                            transaction.execute(
+                                "UPDATE tracks SET tempo_version = ?2 WHERE id = ?1",
+                                params![id, version],
+                            )?;
+                        }
+                    }
                 }
             }
             transaction.commit()?;
@@ -310,18 +363,26 @@ impl Library {
             });
         }
 
-        // Whatever is left in `known` is no longer on disk.
+        // Whatever is left in `known` is no longer on disk. Its tracks stay,
+        // with their playlists and cue points, until found or removed.
         let transaction = self.conn.transaction()?;
-        for locator in known.keys() {
-            transaction.execute(
-                "DELETE FROM tracks WHERE source_id = ?1 AND locator = ?2",
-                params![source_id, locator],
-            )?;
-            summary.removed += 1;
+        for track in known.values() {
+            if !track.missing {
+                transaction.execute("UPDATE tracks SET missing = 1 WHERE id = ?1", [track.id])?;
+                summary.removed += 1;
+            }
         }
         transaction.commit()?;
         Ok(summary)
     }
+}
+
+/// The last part of a locator: the file's name.
+fn file_name(locator: &str) -> String {
+    Path::new(locator)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
 }
 
 pub(crate) fn unix_seconds(time: SystemTime) -> i64 {
@@ -332,7 +393,7 @@ pub(crate) fn unix_seconds(time: SystemTime) -> i64 {
 
 /// Finds audio files under `dir`, skipping hidden files and folders.
 /// Unreadable folders are skipped.
-fn collect_audio_files(dir: &Path, files: &mut Vec<PathBuf>) {
+pub(crate) fn collect_audio_files(dir: &Path, files: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };

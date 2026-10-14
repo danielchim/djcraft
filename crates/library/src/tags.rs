@@ -1009,6 +1009,7 @@ mod tests {
             camelot: Camelot::parse("8A"),
             energy: Some(7),
             year: None,
+            missing: false,
             added_at: 0,
         };
         assert_eq!(

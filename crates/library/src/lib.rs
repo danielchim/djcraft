@@ -33,7 +33,7 @@ pub use scan::{Artwork, ScanProgress, ScanSummary, TrackEdit, read_artwork};
 pub use tags::{AlignOptions, ApplySummary, Cleanup, Placement, PlannedChange, TagBatch, TagField};
 pub use watch::FolderWatcher;
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 /// A measured tempo is shown only when the analysis was at least this sure
 /// of it. Below that (mixes with several tempos, music with no clear beat)
@@ -109,6 +109,8 @@ pub enum Error {
     Tags(String),
     /// An online lookup failed.
     Lookup(String),
+    /// A change to the library could not be made, for the reason given.
+    Library(String),
     /// A folder could not be watched for changes.
     Watch(String),
 }
@@ -121,6 +123,7 @@ impl fmt::Display for Error {
             Error::Import(message) => write!(f, "cannot import: {message}"),
             Error::Tags(message) => write!(f, "cannot write tags: {message}"),
             Error::Lookup(message) => f.write_str(message),
+            Error::Library(message) => f.write_str(message),
             Error::Watch(message) => write!(f, "cannot watch folder: {message}"),
             Error::NewerSchema(version) => write!(
                 f,
@@ -191,6 +194,8 @@ pub struct Track {
     pub energy: Option<u8>,
     /// The year in the file's tags.
     pub year: Option<i32>,
+    /// The file was not found at the last scan.
+    pub missing: bool,
     /// When the track joined the library, in seconds since 1970.
     pub added_at: i64,
 }
@@ -490,6 +495,16 @@ impl Library {
                  ALTER TABLE tracks ADD COLUMN year INTEGER;
                  ALTER TABLE tracks ADD COLUMN year_checked INTEGER NOT NULL DEFAULT 0;
                  PRAGMA user_version = 12;
+                 COMMIT;",
+            )?;
+        }
+        if version < 13 {
+            // Tracks whose files have gone are kept, so that they can be
+            // found again.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE tracks ADD COLUMN missing INTEGER NOT NULL DEFAULT 0;
+                 PRAGMA user_version = 13;
                  COMMIT;",
             )?;
         }
@@ -829,7 +844,7 @@ impl Library {
         let mut sql = format!(
             "SELECT t.id, t.source_id, s.location, t.locator, t.title, t.artist, t.album,
                     t.genre, t.duration, {bpm}, {key}, t.energy, s.name, s.kind,
-                    t.year, t.added_at
+                    t.year, t.missing, t.added_at
              FROM tracks t JOIN sources s ON s.id = t.source_id
              LEFT JOIN playlist_tracks pt ON pt.track_id = t.id AND pt.playlist_id = ?2
              WHERE (?1 IS NULL OR t.source_id = ?1) AND (?2 IS NULL OR pt.track_id IS NOT NULL)
@@ -882,7 +897,8 @@ impl Library {
                 source_name: row.get(12)?,
                 source_kind: source_kind(&row.get::<_, String>(13)?),
                 year: row.get(14)?,
-                added_at: row.get(15)?,
+                missing: row.get(15)?,
+                added_at: row.get(16)?,
             })
         })?;
         let mut tracks: Vec<Track> = tracks.collect::<rusqlite::Result<_>>()?;

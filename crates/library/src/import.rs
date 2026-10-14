@@ -338,7 +338,7 @@ impl Library {
         Ok(find()?)
     }
 
-    fn loose_files_source(&self) -> Result<i64> {
+    pub(crate) fn loose_files_source(&self) -> Result<i64> {
         self.conn.execute(
             "INSERT OR IGNORE INTO sources (kind, location, name)
              VALUES ('files', '', 'Imported files')",
