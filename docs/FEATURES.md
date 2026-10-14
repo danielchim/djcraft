@@ -22,12 +22,12 @@ Status key: `[ ]` to do, `[~]` in progress, `[x]` done.
 ## Milestone 0: foundations
 
 - [x] Cargo workspace with separate crates: `engine`, `library`, `protocol`, `app`
-- [~] Licence allow-list enforced in CI with `cargo-deny` (`deny.toml` passes
-      locally; the CI workflow has not run yet)
+- [x] Licence allow-list enforced in CI with `cargo-deny`
 - [x] Spike: GPUI window drawing a scrolling waveform while the engine plays a
       time-stretched track
-- [~] Confirm `gpui-kit` builds and runs on macOS, Windows and Linux (macOS
-      confirmed; Windows and Linux wait on the first CI run)
+- [~] Confirm `gpui-kit` builds and runs on macOS, Windows and Linux (builds
+      and passes the tests on all three in CI; the app has only been run on
+      macOS)
 - [x] Real-time-safe engine design: no allocation, locking or UI calls on the
       audio thread; lock-free queues between engine and UI
 - [x] Deck playback that follows an external speed and position signal,
@@ -177,7 +177,9 @@ Feature set modelled on Mixed In Key 10.
 
 ### Mixer
 
-- [ ] Trim, channel fader, crossfader with selectable curves
+- [~] Trim, channel fader, crossfader with selectable curves (the engine
+      and protocol have a volume per deck and a master gain; no controls on
+      screen, and no trim or crossfader)
 - [ ] 3-band EQ
 - [ ] Channel filter
 - [ ] Headphone cue with cue/master mix
@@ -380,10 +382,12 @@ waveforms, and options tucked into popovers.
 - [ ] Deck tool tabs under each deck: cues, loops, beat jump, slicer, keyboard,
       stems, FX
 - [ ] Popover panels for per-deck options: BPM, key, beat grid, EQ, crossfader
-- [ ] Drag and drop from library to deck, deck to deck, and into playlists
+- [~] Drag and drop from library to deck, deck to deck, and into playlists
+      (tracks can be dragged from the library onto Flow's lanes only)
 - [ ] First-run setup wizard: theme, waveform style, jog wheels on or off,
       import an existing library
-- [ ] Light and dark themes, plus user themes
+- [~] Light and dark themes, plus user themes (light, dark and match-system;
+      no user themes)
 - [ ] Keyboard shortcut editor
 - [ ] Separate metering window
 - [ ] Layouts that scale from a laptop screen to a large display, with the same

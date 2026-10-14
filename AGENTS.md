@@ -42,7 +42,7 @@ alone.
   mixer is an `Action` in `crates/protocol`, applied with `Engine::apply` under
   a `Role`. The desktop UI is one client of that protocol, not a special case.
 - **Schema changes are migrations.** The library database has a version
-  (`PRAGMA user_version`). Add a new step in `Library::init`; never edit an
+  (`PRAGMA user_version`). Add a new step in `Library::init`. Never edit an
   existing one.
 - **The user's files.** Scanning and importing only read. The one place that
   writes to music files is `Library::edit_track`, on an explicit Save.
@@ -50,7 +50,7 @@ alone.
   and say in brackets what is still missing.
 - **Tests.** Engine and library behaviour is tested without an audio device
   or a window (`Engine::headless`, `Library::open_in_memory`). Add tests there
-  for new behaviour; the app crate has almost none.
+  for new behaviour. The app crate has almost none.
 
 ## Things that are easy to get wrong
 
@@ -60,8 +60,9 @@ alone.
 - GPUI is pre-1.0. Versions are pinned, and the Rust toolchain is pinned in
   `rust-toolchain.toml` because GPUI needs a recent compiler.
 - Dependencies and the engine crate are compiled optimised even in debug
-  builds (see `Cargo.toml`); decoding and DSP are unusably slow otherwise.
-- Set `DJCRAFT_DATA_DIR` when running the app for testing, so it does not
-  touch the real library.
+  builds (see `Cargo.toml`). Decoding and DSP are unusably slow otherwise.
+- When you run the app for testing, set `DJCRAFT_DATA_DIR`. The app then
+  does not touch the real library.
 - The app's two library views (the Library tab and the browser under the
-  decks) each hold their own database connection and refresh when shown.
+  decks) each hold their own database connection. Each view refreshes at the
+  time it comes into view.
