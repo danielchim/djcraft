@@ -92,6 +92,7 @@ impl Shell {
                 this.refresh_grids(cx);
                 cx.notify();
             }
+            LibraryEvent::Columns(hidden) => this.set_hidden_columns(hidden.clone(), cx),
         })
         .detach();
         let browser = cx.new(|cx| LibraryView::new(true, false, window, cx));
@@ -101,9 +102,15 @@ impl Shell {
                 this.refresh_grids(cx);
                 cx.notify();
             }
+            LibraryEvent::Columns(hidden) => this.set_hidden_columns(hidden.clone(), cx),
             LibraryEvent::Selected { .. } | LibraryEvent::Changed => {}
         })
         .detach();
+        for view in [&library, &browser] {
+            view.update(cx, |view, cx| {
+                view.set_hidden_columns(&settings.hidden_columns, cx)
+            });
+        }
         let mut shell = Self {
             // Tracks named on the command line go to the decks, so show them.
             tab: match settings.start_tab {
@@ -149,6 +156,20 @@ impl Shell {
             .and_then(|path| library.track_at(path));
         self.browser
             .update(cx, |view, cx| view.set_reference(reference, cx));
+    }
+
+    /// Hides the named columns in every track list, and remembers that.
+    fn set_hidden_columns(&mut self, hidden: Vec<String>, cx: &mut Context<Self>) {
+        self.settings.hidden_columns = hidden;
+        cx.set_global(self.settings.clone());
+        for view in [&self.library, &self.browser] {
+            view.update(cx, |view, cx| {
+                view.set_hidden_columns(&self.settings.hidden_columns, cx)
+            });
+        }
+        if let Err(error) = self.settings.save(&data_dir()) {
+            eprintln!("could not save settings: {error}");
+        }
     }
 
     pub fn show(&mut self, tab: Tab, cx: &mut Context<Self>) {

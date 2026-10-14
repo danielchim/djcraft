@@ -191,6 +191,8 @@ pub enum LibraryEvent {
     /// A scan or analysis moved on, so the database may hold different
     /// tracks, or new results for them.
     Changed,
+    /// The user chose which columns to hide in track lists.
+    Columns(Vec<String>),
 }
 
 /// A track being dragged out of a track list.
@@ -1781,6 +1783,60 @@ impl LibraryView {
         Some((id, track.title.into()))
     }
 
+    /// Shows only the columns not named in `hidden`.
+    pub fn set_hidden_columns(&mut self, hidden: &[String], cx: &mut Context<Self>) {
+        let visible: Vec<usize> = COLUMNS
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, name, _))| !hidden.iter().any(|h| h == name))
+            .map(|(index, _)| index)
+            .collect();
+        self.table.update(cx, |table, cx| {
+            if table.delegate().visible != visible {
+                let delegate = table.delegate_mut();
+                delegate.visible = visible;
+                delegate.sort = None;
+                table.refresh(cx);
+            }
+        });
+    }
+
+    /// A menu of columns to show or hide.
+    fn columns_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let visible = self.table.read(cx).delegate().visible.clone();
+        let view = cx.weak_entity();
+        Button::new("columns")
+            .ghost()
+            .small()
+            .icon(IconName::Columns3)
+            .tooltip("Columns")
+            .dropdown_menu(move |mut menu, _, _| {
+                // The title is always shown.
+                for (index, (_, name, _)) in COLUMNS.iter().enumerate().skip(1) {
+                    let shown = visible.contains(&index);
+                    let mut hidden: Vec<String> = COLUMNS
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| !visible.contains(i))
+                        .map(|(_, (_, name, _))| name.to_string())
+                        .collect();
+                    if shown {
+                        hidden.push(name.to_string());
+                    } else {
+                        hidden.retain(|h| h != name);
+                    }
+                    let view = view.clone();
+                    menu = menu.item(PopupMenuItem::new(*name).checked(shown).on_click(
+                        move |_, _, cx| {
+                            view.update(cx, |_, cx| cx.emit(LibraryEvent::Columns(hidden.clone())))
+                                .ok();
+                        },
+                    ));
+                }
+                menu
+            })
+    }
+
     /// Opens a small dialog that asks for a name, then calls `done` with it.
     fn ask_name(
         &mut self,
@@ -3257,6 +3313,7 @@ impl LibraryView {
                             )
                         },
                     )
+                    .child(self.columns_button(cx))
                     .when(!self.compact, |this| this.child(self.tag_tools_button(cx)))
                     .when(self.wheel_in_browser, |this| {
                         this.child(self.wheel_button(cx))

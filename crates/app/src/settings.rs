@@ -119,6 +119,8 @@ pub struct Settings {
     pub acoustid_key: String,
     /// The user's own Discogs personal access token.
     pub discogs_token: String,
+    /// Columns left out of track lists, by name.
+    pub hidden_columns: Vec<String>,
 }
 
 impl Global for Settings {}
@@ -181,6 +183,7 @@ impl Default for Settings {
             energy_placement: Placement::Comment,
             acoustid_key: String::new(),
             discogs_token: String::new(),
+            hidden_columns: vec!["Year".into()],
         }
     }
 }
@@ -262,6 +265,7 @@ mod tests {
             energy_placement: Placement::Grouping,
             acoustid_key: "key".into(),
             discogs_token: "token".into(),
+            hidden_columns: vec!["Album".into()],
         };
         settings.save(&dir).unwrap();
         assert_eq!(Settings::load(&dir), settings);
