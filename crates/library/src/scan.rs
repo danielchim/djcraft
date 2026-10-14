@@ -257,6 +257,13 @@ impl Library {
             })?;
             rows.collect::<rusqlite::Result<_>>()?
         };
+        let ignored: HashSet<String> = {
+            let mut statement = self
+                .conn
+                .prepare("SELECT locator FROM ignored_files WHERE source_id = ?1")?;
+            let rows = statement.query_map([source_id], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
 
         // Each file with the locator it is stored under.
         let mut files: Vec<(String, PathBuf)> = Vec::new();
@@ -281,6 +288,7 @@ impl Library {
                 }
             }
         }
+        files.retain(|(locator, _)| !ignored.contains(locator));
         files.sort();
 
         // Tracks whose files are not where they were, by file name and size,

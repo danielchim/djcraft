@@ -734,6 +734,12 @@ fn bare_title(title: &str) -> String {
     bare[..cut].split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// A name reduced to lowercase words without punctuation, for telling
+/// whether two names are the same.
+pub(crate) fn normal_words(text: &str) -> String {
+    words(text).join(" ")
+}
+
 /// Lowercase words, without punctuation, for comparing names.
 fn words(text: &str) -> Vec<String> {
     text.to_lowercase()

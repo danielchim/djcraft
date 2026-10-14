@@ -29,13 +29,14 @@ pub use flow::{
 };
 pub use import::{ImportSummary, ImportedPlaylist, read_playlists};
 pub use organise::{
-    EnergyBand, Group, GroupCount, PlaylistFolder, Rule, SmartRules, TextField, TextOp,
+    DuplicateGroup, EnergyBand, Group, GroupCount, PlaylistFolder, Rule, SmartRules, TextField,
+    TextOp,
 };
 pub use scan::{Artwork, ScanProgress, ScanSummary, TrackEdit, read_artwork};
 pub use tags::{AlignOptions, ApplySummary, Cleanup, Placement, PlannedChange, TagBatch, TagField};
 pub use watch::FolderWatcher;
 
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 
 /// A measured tempo is shown only when the analysis was at least this sure
 /// of it. Below that (mixes with several tempos, music with no clear beat)
@@ -536,6 +537,20 @@ impl Library {
                 "BEGIN;
                  ALTER TABLE playlists ADD COLUMN rules TEXT;
                  PRAGMA user_version = 15;
+                 COMMIT;",
+            )?;
+        }
+        if version < 16 {
+            // Files left out of the library on purpose, such as duplicates,
+            // which scans do not add back.
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE ignored_files (
+                     source_id INTEGER NOT NULL REFERENCES sources (id) ON DELETE CASCADE,
+                     locator TEXT NOT NULL,
+                     PRIMARY KEY (source_id, locator)
+                 );
+                 PRAGMA user_version = 16;
                  COMMIT;",
             )?;
         }

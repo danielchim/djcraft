@@ -27,7 +27,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::lookup_view::{LookupEvent, LookupField, LookupView};
-use crate::organise_view::{NameForm, OrganiseEvent, RelocateView, SmartForm};
+use crate::organise_view::{DuplicatesView, NameForm, OrganiseEvent, RelocateView, SmartForm};
 use crate::tag_tools::{FormEvent, RenameForm, ReplaceForm, ReviewEvent, ReviewView};
 
 /// How often the track list is refreshed while a scan is running.
@@ -665,6 +665,8 @@ pub struct LibraryView {
     folders: Vec<PlaylistFolder>,
     /// Playlist folders shown closed.
     collapsed: HashSet<i64>,
+    /// The duplicates dialog, while it is open, to refresh after a merge.
+    duplicates: Option<Entity<DuplicatesView>>,
     /// The key picked on the Camelot wheel.
     wheel_key: Option<Camelot>,
     key_counts: HashMap<Camelot, usize>,
@@ -773,6 +775,7 @@ impl LibraryView {
             groups: Vec::new(),
             folders: Vec::new(),
             collapsed: HashSet::new(),
+            duplicates: None,
             flow: (!compact).then(|| cx.new(|cx| crate::flow_view::FlowView::new(window, cx))),
             wheel_key: None,
             key_counts: HashMap::new(),
@@ -1451,6 +1454,9 @@ impl LibraryView {
                 }
                 menu.separator()
                     .label("Library")
+                    .item(item("Find duplicates…".into(), |this, window, cx| {
+                        this.find_duplicates(window, cx)
+                    }))
                     .item(item("Find missing files in a folder…".into(), |this, window, cx| {
                         this.find_moved(window, cx)
                     }))
@@ -1813,6 +1819,47 @@ impl LibraryView {
         };
         window.open_dialog(cx, move |dialog, _, _| {
             dialog.title(title).w(px(680.)).child(form.clone())
+        });
+    }
+
+    /// Lists duplicate tracks for the user to choose which copy to keep.
+    fn find_duplicates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(library) = &self.library else {
+            return;
+        };
+        let groups = match library.duplicate_groups() {
+            Ok(groups) => groups,
+            Err(error) => {
+                self.error = Some(error.to_string().into());
+                cx.notify();
+                return;
+            }
+        };
+        let view = cx.new(|_| DuplicatesView::new(groups));
+        self.duplicates = Some(view.clone());
+        cx.subscribe_in(
+            &view,
+            window,
+            |this, view, event: &OrganiseEvent, window, cx| match event {
+                OrganiseEvent::Merge(keep, others) => {
+                    let (keep, others) = (*keep, others.clone());
+                    this.change_library(|library| library.merge_duplicates(keep, &others), cx);
+                    let groups = this
+                        .library
+                        .as_ref()
+                        .and_then(|library| library.duplicate_groups().ok())
+                        .unwrap_or_default();
+                    view.update(cx, |view, cx| view.set_groups(groups, cx));
+                }
+                _ => {
+                    this.duplicates = None;
+                    window.close_dialog(cx);
+                }
+            },
+        )
+        .detach();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog.title("Duplicates").w(px(820.)).child(view.clone())
         });
     }
 

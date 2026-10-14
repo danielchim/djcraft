@@ -399,7 +399,8 @@ fn an_existing_library_gains_playlists_on_upgrade() {
     // Put the file back to how the first schema left it.
     let raw = rusqlite::Connection::open(&db).unwrap();
     raw.execute_batch(
-        "ALTER TABLE playlists DROP COLUMN folder_id;
+        "DROP TABLE ignored_files;
+         ALTER TABLE playlists DROP COLUMN folder_id;
          DROP TABLE playlist_folders;
          ALTER TABLE playlists DROP COLUMN rules;
          ALTER TABLE tracks DROP COLUMN year;
@@ -1399,6 +1400,59 @@ fn tracks_fall_into_automatic_groups() {
         ..Default::default()
     };
     assert_eq!(library.tracks(&tech).unwrap().len(), 2);
+}
+
+#[test]
+fn duplicates_merge_into_the_copy_kept() {
+    let dir = TempDir::new("duplicates");
+    write_tagged(&dir.0.join("a.wav"), "Losing It", "Fisher", "", "", "");
+    write_tagged(&dir.0.join("b.wav"), "Losing It", "FISHER", "", "", "");
+    write_tagged(
+        &dir.0.join("c.wav"),
+        "Losing It (Remix)",
+        "Fisher",
+        "",
+        "",
+        "",
+    );
+    write_wav_of(&dir.0.join("d.wav"), 3);
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let all = library.tracks(&TrackQuery::default()).unwrap();
+    let id_of = |name: &str| all.iter().find(|t| t.path.ends_with(name)).unwrap().id;
+    let set = library.create_playlist("Set").unwrap();
+    library.add_to_playlist(set.id, &[id_of("b.wav")]).unwrap();
+
+    // a and b match by name and length; c is another mix, and d other audio.
+    let groups = library.duplicate_groups().unwrap();
+    assert_eq!(groups.len(), 1);
+    let group: Vec<i64> = groups[0].tracks.iter().map(|t| t.id).collect();
+    assert_eq!(group.len(), 2);
+    // The copy in a playlist is the one suggested to keep.
+    assert_eq!(group[0], id_of("b.wav"));
+
+    library
+        .merge_duplicates(id_of("a.wav"), &[id_of("b.wav")])
+        .unwrap();
+    // The playlist now holds the kept copy, and a scan does not bring the
+    // other back.
+    let in_set = TrackQuery {
+        playlist: Some(set.id),
+        ..Default::default()
+    };
+    assert_eq!(library.tracks(&in_set).unwrap()[0].id, id_of("a.wav"));
+    let summary = library.scan(source.id, |_| {}).unwrap();
+    assert_eq!(summary.added, 0);
+    assert_eq!(library.tracks(&TrackQuery::default()).unwrap().len(), 3);
+    assert!(dir.0.join("b.wav").exists());
+
+    // Files with the same audio and length but other tags count too.
+    std::fs::copy(dir.0.join("d.wav"), dir.0.join("e.wav")).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let groups = library.duplicate_groups().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].tracks.len(), 2);
 }
 
 #[test]

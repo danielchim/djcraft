@@ -1,5 +1,5 @@
 //! Organising the library: playlist folders and order, smart playlists,
-//! automatic groups, and tracks whose files have gone missing.
+//! automatic groups, duplicates, and tracks whose files have gone missing.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -249,6 +249,15 @@ pub struct PlaylistFolder {
     pub parent: Option<i64>,
 }
 
+/// Tracks that look like copies of one another, the one best kept first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DuplicateGroup {
+    pub tracks: Vec<Track>,
+}
+
+/// Copies of a track may differ in length by this much, from encoding.
+const DUPLICATE_SECONDS: f64 = 2.0;
+
 impl Library {
     /// The rules of a smart playlist; `None` for an ordinary one.
     pub fn playlist_rules(&self, playlist: i64) -> Result<Option<SmartRules>> {
@@ -451,6 +460,137 @@ impl Library {
         Ok(groups)
     }
 
+    /// Groups of tracks that look like copies: the same artist and title
+    /// with about the same length, or files of exactly the same size and
+    /// length. In each group, the copy best kept comes first: one whose
+    /// file is there, in the most playlists, with the largest file.
+    pub fn duplicate_groups(&self) -> Result<Vec<DuplicateGroup>> {
+        let tracks = self.tracks(&TrackQuery::default())?;
+        let info: HashMap<i64, (i64, usize)> = {
+            let mut statement = self.conn.prepare(
+                "SELECT t.id, t.file_size, COUNT(pt.playlist_id) FROM tracks t
+                 LEFT JOIN playlist_tracks pt ON pt.track_id = t.id GROUP BY t.id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get(0)?, (row.get(1)?, row.get::<_, i64>(2)? as usize)))
+            })?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        // Joins tracks into groups as matches are found.
+        let mut parent: Vec<usize> = (0..tracks.len()).collect();
+        fn root(parent: &mut [usize], mut at: usize) -> usize {
+            while parent[at] != at {
+                parent[at] = parent[parent[at]];
+                at = parent[at];
+            }
+            at
+        }
+        let join = |a: usize, b: usize, parent: &mut Vec<usize>| {
+            let (a, b) = (root(parent, a), root(parent, b));
+            if a != b {
+                parent[a] = b;
+            }
+        };
+        let normal = |text: &str| crate::lookup::normal_words(text);
+        let mut by_name: HashMap<(String, String), Vec<usize>> = HashMap::new();
+        let mut by_size: HashMap<i64, Vec<usize>> = HashMap::new();
+        for (index, track) in tracks.iter().enumerate() {
+            let title = normal(&track.title);
+            if !title.is_empty() {
+                by_name
+                    .entry((normal(&track.artist), title))
+                    .or_default()
+                    .push(index);
+            }
+            if let Some((size, _)) = info.get(&track.id).filter(|(size, _)| *size > 0) {
+                by_size.entry(*size).or_default().push(index);
+            }
+        }
+        for candidates in by_name.values().chain(by_size.values()) {
+            for (i, &a) in candidates.iter().enumerate() {
+                for &b in &candidates[i + 1..] {
+                    let close = (tracks[a].duration_seconds - tracks[b].duration_seconds).abs()
+                        <= DUPLICATE_SECONDS;
+                    if close {
+                        join(a, b, &mut parent);
+                    }
+                }
+            }
+        }
+        let mut groups: HashMap<usize, Vec<Track>> = HashMap::new();
+        for (index, track) in tracks.iter().enumerate() {
+            let group = root(&mut parent, index);
+            groups.entry(group).or_default().push(track.clone());
+        }
+        let mut groups: Vec<DuplicateGroup> = groups
+            .into_values()
+            .filter(|tracks| tracks.len() > 1)
+            .map(|mut tracks| {
+                tracks.sort_by_key(|track| {
+                    let (size, playlists) = info.get(&track.id).copied().unwrap_or((0, 0));
+                    (
+                        track.missing,
+                        std::cmp::Reverse(playlists),
+                        std::cmp::Reverse(size),
+                    )
+                });
+                DuplicateGroup { tracks }
+            })
+            .collect();
+        groups.sort_by_key(|group| {
+            (
+                group.tracks[0].artist.to_lowercase(),
+                group.tracks[0].title.to_lowercase(),
+            )
+        });
+        Ok(groups)
+    }
+
+    /// Keeps one copy of a track and takes the others out of the library.
+    /// Their places in playlists and Flow pass to the kept copy, and their
+    /// files are left on disk but no longer added by scans.
+    pub fn merge_duplicates(&mut self, keep: i64, others: &[i64]) -> Result<()> {
+        let transaction = self.conn.transaction()?;
+        for &other in others.iter().filter(|other| **other != keep) {
+            let playlists: Vec<i64> = {
+                let mut statement = transaction
+                    .prepare("SELECT playlist_id FROM playlist_tracks WHERE track_id = ?1")?;
+                let rows = statement.query_map([other], |row| row.get(0))?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            for playlist in playlists {
+                let has_keep: bool = transaction.query_row(
+                    "SELECT COUNT(*) > 0 FROM playlist_tracks WHERE playlist_id = ?1 AND track_id = ?2",
+                    params![playlist, keep],
+                    |row| row.get(0),
+                )?;
+                if has_keep {
+                    transaction.execute(
+                        "DELETE FROM playlist_tracks WHERE playlist_id = ?1 AND track_id = ?2",
+                        params![playlist, other],
+                    )?;
+                } else {
+                    transaction.execute(
+                        "UPDATE playlist_tracks SET track_id = ?3 WHERE playlist_id = ?1 AND track_id = ?2",
+                        params![playlist, other, keep],
+                    )?;
+                }
+            }
+            transaction.execute(
+                "UPDATE flow_clips SET track_id = ?2 WHERE track_id = ?1",
+                params![other, keep],
+            )?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO ignored_files (source_id, locator)
+                 SELECT source_id, locator FROM tracks WHERE id = ?1",
+                [other],
+            )?;
+            transaction.execute("DELETE FROM tracks WHERE id = ?1", [other])?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// For tracks marked missing, files under `folder` that are probably
     /// theirs: the same file name and, where the old size is known, the same
     /// size.
@@ -549,6 +689,10 @@ impl Library {
         transaction.execute(
             "UPDATE tracks SET source_id = ?2, locator = ?3, missing = 0 WHERE id = ?1",
             params![id, source_id, locator],
+        )?;
+        transaction.execute(
+            "DELETE FROM ignored_files WHERE source_id = ?1 AND locator = ?2",
+            params![source_id, locator],
         )?;
         store_track(&transaction, source_id, &locator, &file, stamp)?;
         // The same audio, so its analysis still holds.

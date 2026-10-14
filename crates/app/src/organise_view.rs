@@ -1,9 +1,9 @@
 //! Dialogs for organising the library: naming things, smart playlist rules,
-//! and finding moved files.
+//! duplicates, and finding moved files.
 
 use std::path::PathBuf;
 
-use djcraft_library::{Camelot, Rule, SmartRules, TextField, TextOp, Track};
+use djcraft_library::{Camelot, DuplicateGroup, Rule, SmartRules, TextField, TextOp, Track};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Sizable,
@@ -21,6 +21,8 @@ pub enum OrganiseEvent {
     Named(String),
     /// A smart playlist was set up: its name and rules.
     Smart(String, SmartRules),
+    /// Keep the first track; take the others out of the library.
+    Merge(i64, Vec<i64>),
     /// Point each track at its file in a new place.
     Relocate(Vec<(i64, PathBuf)>),
     Close,
@@ -459,6 +461,124 @@ impl Render for SmartForm {
                     .child("The playlist updates by itself as the library changes."),
             )
             .child(footer("smart", "Save", ready, Self::submit, cx))
+    }
+}
+
+/// Groups of tracks that look like copies, with a choice of which to keep.
+pub struct DuplicatesView {
+    groups: Vec<DuplicateGroup>,
+    /// The track to keep in each group, as a place in it.
+    keep: Vec<usize>,
+}
+
+impl DuplicatesView {
+    pub fn new(groups: Vec<DuplicateGroup>) -> Self {
+        let keep = vec![0; groups.len()];
+        Self { groups, keep }
+    }
+
+    /// Shows the groups as they are now, after a merge.
+    pub fn set_groups(&mut self, groups: Vec<DuplicateGroup>, cx: &mut Context<Self>) {
+        self.keep = vec![0; groups.len()];
+        self.groups = groups;
+        cx.notify();
+    }
+
+    fn merge(&mut self, group: usize, cx: &mut Context<Self>) {
+        let Some(tracks) = self.groups.get(group).map(|g| &g.tracks) else {
+            return;
+        };
+        let keep = tracks[self.keep[group]].id;
+        let others = tracks
+            .iter()
+            .map(|t| t.id)
+            .filter(|id| *id != keep)
+            .collect();
+        cx.emit(OrganiseEvent::Merge(keep, others));
+    }
+}
+
+impl EventEmitter<OrganiseEvent> for DuplicatesView {}
+
+impl Render for DuplicatesView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (muted, border) = (theme.muted_foreground, theme.border);
+        let groups: Vec<AnyElement> = self
+            .groups
+            .iter()
+            .enumerate()
+            .map(|(group, duplicates)| {
+                let rows = duplicates.tracks.iter().enumerate().map(|(index, track)| {
+                    let minutes = track.duration_seconds.round() as u64;
+                    Checkbox::new(("keep", group * 1000 + index))
+                        .checked(self.keep[group] == index)
+                        .label(format!(
+                            "{} — {}  ({}:{:02}{})  {}",
+                            track.artist,
+                            track.title,
+                            minutes / 60,
+                            minutes % 60,
+                            if track.missing { ", missing" } else { "" },
+                            track.path.display()
+                        ))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.keep[group] = index;
+                            cx.notify();
+                        }))
+                });
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(border)
+                    .children(rows)
+                    .child(
+                        div().flex().justify_end().child(
+                            Button::new(("merge", group))
+                                .outline()
+                                .small()
+                                .label("Keep the ticked one")
+                                .on_click(cx.listener(move |this, _, _, cx| this.merge(group, cx))),
+                        ),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(div().text_sm().text_color(muted).child(if groups.is_empty() {
+                "No duplicates found.".to_string()
+            } else {
+                let groups = match groups.len() {
+                    1 => "1 group of tracks looks".to_string(),
+                    count => format!("{count} groups of tracks look"),
+                };
+                format!(
+                    "{groups} like copies: the same artist and title with about the same length, or the same file size. Tick the one to keep. The others leave the library and their playlist places pass to it. No file is deleted."
+                )
+            }))
+            .child(
+                div()
+                    .id("duplicate-groups")
+                    .flex()
+                    .flex_col()
+                    .max_h(px(440.))
+                    .overflow_y_scroll()
+                    .children(groups),
+            )
+            .child(
+                div().flex().justify_end().child(
+                    Button::new("duplicates-done")
+                        .primary()
+                        .label("Done")
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(OrganiseEvent::Close))),
+                ),
+            )
     }
 }
 
