@@ -1,6 +1,7 @@
 mod analysis;
 mod flow_view;
 mod library_view;
+mod lookup_view;
 mod settings;
 mod settings_view;
 mod shell;

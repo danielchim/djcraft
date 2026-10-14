@@ -91,8 +91,10 @@ Feature set modelled on Mixed In Key 10.
       album, genre, BPM and key, one track at a time from the info panel;
       writing is tested on WAV only)
 - [ ] Audio fingerprint lookup (Chromaprint/AcoustID)
-- [~] Metadata match from MusicBrainz and Discogs (MusicBrainz search by
-      artist and title from the info panel; no Discogs yet)
+- [~] Metadata match from MusicBrainz and Discogs (MusicBrainz or the
+      iTunes Store, searched from a popup that tidies untidy tags, ranks the
+      results, prefers original releases over compilations, and lets you
+      pick which details to copy; no Discogs yet)
 - [ ] Review-and-diff screen before any tag is written
 - [ ] Batch tag alignment with undo
 - [ ] Choose where key and energy are written: key field, comment, grouping,

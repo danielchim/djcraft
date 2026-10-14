@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 use djcraft_analysis::TempoRange;
-use djcraft_library::lookup::{self, Provider, TrackMatch};
+use djcraft_library::lookup::Provider;
 use djcraft_library::{
     Camelot, FolderWatcher, ImportSummary, Library, Playlist, Source, SourceKind, TempoResult,
     Track, TrackEdit, TrackQuery, read_artwork, read_playlists,
@@ -24,6 +24,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+
+use crate::lookup_view::{LookupEvent, LookupField, LookupView};
 
 /// How often the track list is refreshed while a scan is running.
 const SCAN_REFRESH: Duration = Duration::from_millis(400);
@@ -589,8 +591,6 @@ pub struct LibraryView {
     /// One text box per [`EditField`], in that order.
     fields: [Entity<InputState>; 6],
     artwork: Option<Arc<Image>>,
-    matches: Vec<TrackMatch>,
-    looking_up: bool,
     provider: Provider,
     /// Whether the info panel's details can be changed. Off until asked.
     editing: bool,
@@ -700,8 +700,6 @@ impl LibraryView {
             inspected: None,
             fields,
             artwork: None,
-            matches: Vec::new(),
-            looking_up: false,
             provider: Provider::default(),
             editing: false,
             running_scans: 0,
@@ -1029,7 +1027,6 @@ impl LibraryView {
         ] {
             self.set_field(field, text, window, cx);
         }
-        self.matches.clear();
         self.artwork = None;
         self.notice = None;
         self.editing = false;
@@ -1111,57 +1108,45 @@ impl LibraryView {
         cx.notify();
     }
 
-    /// Asks the chosen provider what the track in the info panel might be.
-    fn look_up(&mut self, cx: &mut Context<Self>) {
-        let (mut artist, mut title) = (
-            self.field_text(EditField::Artist, cx),
+    /// Opens the Look up popup for the track in the info panel, searching
+    /// with what the text boxes hold now.
+    fn open_lookup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = [
             self.field_text(EditField::Title, cx),
-        );
-        // Untagged files are often named "Artist - Title".
-        if artist.is_empty()
-            && let Some((left, right)) = title.clone().split_once(" - ")
-        {
-            (artist, title) = (left.trim().to_string(), right.trim().to_string());
-        }
+            self.field_text(EditField::Artist, cx),
+            self.field_text(EditField::Album, cx),
+            self.field_text(EditField::Genre, cx),
+        ];
         let provider = self.provider;
-        self.looking_up = true;
-        self.matches.clear();
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move { lookup::search(provider, &artist, &title) })
-                .await;
-            this.update(cx, |this, cx| {
-                this.looking_up = false;
-                match result {
-                    Ok(matches) => {
-                        this.error = None;
-                        this.notice = matches
-                            .is_empty()
-                            .then(|| format!("{} found no match.", provider.label()).into());
-                        this.matches = matches;
+        let lookup = cx.new(|cx| LookupView::new(current, provider, window, cx));
+        cx.subscribe_in(
+            &lookup,
+            window,
+            |this, _, event: &LookupEvent, window, cx| {
+                if let LookupEvent::Apply(values) = event {
+                    for (field, value) in values {
+                        let field = match field {
+                            LookupField::Title => EditField::Title,
+                            LookupField::Artist => EditField::Artist,
+                            LookupField::Album => EditField::Album,
+                            LookupField::Genre => EditField::Genre,
+                        };
+                        this.set_field(field, value, window, cx);
                     }
-                    Err(error) => this.error = Some(error.to_string().into()),
+                    this.notice = (!values.is_empty())
+                        .then(|| "Details copied. Press Save to write them to the file.".into());
+                    cx.notify();
                 }
-                cx.notify();
-            })
-            .ok();
-        })
+                window.close_dialog(cx);
+            },
+        )
         .detach();
-    }
-
-    /// Copies a lookup result into the text boxes. Nothing is saved yet.
-    fn apply_match(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(found) = self.matches.get(index).cloned() else {
-            return;
-        };
-        self.set_field(EditField::Title, &found.title, window, cx);
-        self.set_field(EditField::Artist, &found.artist, window, cx);
-        self.set_field(EditField::Album, &found.album, window, cx);
-        if let Some(genre) = &found.genre {
-            self.set_field(EditField::Genre, genre, window, cx);
-        }
-        cx.notify();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("Look up track details")
+                .w(px(760.))
+                .child(lookup.clone())
+        });
     }
 
     /// Lists the other tracks on the inspected track's album.
@@ -1337,43 +1322,14 @@ impl LibraryView {
                             Button::new("look-up")
                                 .outline()
                                 .icon(IconName::Search)
-                                .label(if self.looking_up {
-                                    "Looking up…"
-                                } else {
-                                    "Look up"
-                                })
-                                .tooltip(format!("Search {} for this track", self.provider.label()))
-                                .disabled(self.looking_up)
-                                .on_click(cx.listener(|this, _, _, cx| this.look_up(cx))),
+                                .label("Look up…")
+                                .tooltip("Search an online database for this track's details")
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.open_lookup(window, cx)),
+                                ),
                         ),
                 )
             })
-            .children(self.matches.iter().enumerate().map(|(index, found)| {
-                let detail = [
-                    Some(found.album.clone()).filter(|album| !album.is_empty()),
-                    found.year.clone(),
-                    found.genre.clone(),
-                ]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(" · ");
-                div()
-                    .id(("match", index))
-                    .flex()
-                    .flex_col()
-                    .p_2()
-                    .border_1()
-                    .border_color(border)
-                    .rounded_md()
-                    .text_sm()
-                    .hover(|style| style.bg(tile))
-                    .child(format!("{} — {}", found.artist, found.title))
-                    .child(div().text_xs().text_color(muted).child(detail))
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.apply_match(index, window, cx)),
-                    )
-            }))
     }
 
     /// Gives a compact browser a button that pops up the Camelot wheel.

@@ -19,7 +19,8 @@ is the full plan, with the status of every item.
   them from a rekordbox XML export, a VirtualDJ folder, or M3U files.
 - **Track info:** view a track's details and cover art, edit them (changes are
   written to the file's tags), and look them up on MusicBrainz or the iTunes
-  Store.
+  Store. The lookup opens a popup that lists the matches, best first, and
+  lets you choose which details to copy.
 - **Decks:** two decks with tempo control and key lock. Each deck shows a
   scrolling waveform with the beat grid and bar lines, and a whole-track
   waveform that you click to jump. Tracks become playable within a second
