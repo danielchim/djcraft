@@ -38,6 +38,7 @@ struct Tags {
     duration: f64,
     bpm: Option<f64>,
     key: Option<String>,
+    year: Option<i32>,
 }
 
 /// The details djcraft reads from and writes to a file's tags.
@@ -185,13 +186,15 @@ pub(crate) fn store_track(
     let tags = read_tags(path);
     conn.execute(
         "INSERT INTO tracks (source_id, locator, title, artist, album, genre,
-                             duration, bpm, key, file_size, modified_at, added_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                             duration, bpm, key, file_size, modified_at, added_at,
+                             year, year_checked)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1)
          ON CONFLICT (source_id, locator) DO UPDATE SET
              title = excluded.title, artist = excluded.artist,
              album = excluded.album, genre = excluded.genre,
              duration = excluded.duration, bpm = excluded.bpm, key = excluded.key,
              file_size = excluded.file_size, modified_at = excluded.modified_at,
+             year = excluded.year, year_checked = 1,
              tempo_version = NULL",
         params![
             source_id,
@@ -205,7 +208,8 @@ pub(crate) fn store_track(
             tags.key,
             size,
             modified,
-            unix_seconds(SystemTime::now())
+            unix_seconds(SystemTime::now()),
+            tags.year
         ],
     )?;
     Ok(())
@@ -223,12 +227,25 @@ impl Library {
         let Some(source) = self.source(source_id)? else {
             return Ok(ScanSummary::default());
         };
-        let mut known: HashMap<String, (i64, i64)> = {
+        struct Known {
+            id: i64,
+            stamp: (i64, i64),
+            year_checked: bool,
+        }
+        let mut known: HashMap<String, Known> = {
             let mut statement = self.conn.prepare(
-                "SELECT locator, file_size, modified_at FROM tracks WHERE source_id = ?1",
+                "SELECT locator, id, file_size, modified_at, year_checked
+                 FROM tracks WHERE source_id = ?1",
             )?;
             let rows = statement.query_map([source_id], |row| {
-                Ok((row.get(0)?, (row.get(1)?, row.get(2)?)))
+                Ok((
+                    row.get(0)?,
+                    Known {
+                        id: row.get(1)?,
+                        stamp: (row.get(2)?, row.get(3)?),
+                        year_checked: row.get(4)?,
+                    },
+                ))
             })?;
             rows.collect::<rusqlite::Result<_>>()?
         };
@@ -267,7 +284,15 @@ impl Library {
                     continue;
                 };
                 let previous = known.remove(locator);
-                if previous == Some(stamp) {
+                if let Some(track) = previous.as_ref().filter(|track| track.stamp == stamp) {
+                    // Libraries from before years were read get them
+                    // without the file counting as changed.
+                    if !track.year_checked {
+                        transaction.execute(
+                            "UPDATE tracks SET year = ?2, year_checked = 1 WHERE id = ?1",
+                            params![track.id, read_tags(path).year],
+                        )?;
+                    }
                     summary.unchanged += 1;
                     continue;
                 }
@@ -346,6 +371,7 @@ fn read_tags(path: &Path) -> Tags {
         duration: 0.0,
         bpm: None,
         key: None,
+        year: None,
     };
     if let Ok(file) = lofty::read_from_path(path) {
         tags.duration = file.properties().duration().as_secs_f64();
@@ -362,6 +388,20 @@ fn read_tags(path: &Path) -> Tags {
                 .or_else(|| tag.get_string(ItemKey::IntegerBpm))
                 .and_then(|bpm| bpm.trim().parse::<f64>().ok())
                 .filter(|bpm| *bpm > 0.0);
+            tags.year = tag
+                .date()
+                .map(|date| date.year as i32)
+                .or_else(|| {
+                    [
+                        ItemKey::Year,
+                        ItemKey::ReleaseDate,
+                        ItemKey::OriginalReleaseDate,
+                    ]
+                    .into_iter()
+                    .find_map(|key| tag.get_string(key))
+                    .and_then(|text| text.trim().get(..4)?.parse().ok())
+                })
+                .filter(|year| (1000..=9999).contains(year));
             tags.key = tag
                 .get_string(ItemKey::InitialKey)
                 .map(|key| key.trim().to_string())

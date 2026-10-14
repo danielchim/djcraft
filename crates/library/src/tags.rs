@@ -1008,6 +1008,8 @@ mod tests {
             key: Some("8A".into()),
             camelot: Camelot::parse("8A"),
             energy: Some(7),
+            year: None,
+            added_at: 0,
         };
         assert_eq!(
             render_name("{artist} - {title}", &track).as_deref(),

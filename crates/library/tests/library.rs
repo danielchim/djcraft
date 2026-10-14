@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use djcraft_library::{
-    AlignOptions, Camelot, Cleanup, ClipPlacement, CuePoint, FolderWatcher, ImportSummary,
-    KeepTagged, KeyResult, Library, Placement, ScanSummary, SourceKind, TagField, TempoResult,
-    TrackEdit, TrackQuery, read_artwork, read_playlists,
+    AlignOptions, Camelot, Cleanup, ClipPlacement, CuePoint, EnergyBand, FolderWatcher, Group,
+    ImportSummary, KeepTagged, KeyResult, Library, Placement, ScanSummary, SourceKind, TagField,
+    TempoResult, TrackEdit, TrackQuery, read_artwork, read_playlists,
 };
 use lofty::config::WriteOptions;
 use lofty::tag::{Accessor, ItemKey, Tag, TagExt, TagType};
@@ -397,7 +397,9 @@ fn an_existing_library_gains_playlists_on_upgrade() {
     // Put the file back to how the first schema left it.
     let raw = rusqlite::Connection::open(&db).unwrap();
     raw.execute_batch(
-        "DROP TABLE tag_history; DROP TABLE tag_batches;
+        "ALTER TABLE tracks DROP COLUMN year;
+         ALTER TABLE tracks DROP COLUMN year_checked;
+         DROP TABLE tag_history; DROP TABLE tag_batches;
          DROP TABLE playlist_tracks; DROP TABLE playlists;
          DROP TABLE options;
          ALTER TABLE tracks DROP COLUMN tempo_downbeat;
@@ -1165,6 +1167,70 @@ fn tags_are_written_and_read_back_in_every_format() {
         assert_eq!(track.artist, "Artist Ü");
         assert_eq!(track.camelot, Camelot::parse("8A"), "{}", track.title);
     }
+}
+
+#[test]
+fn tracks_fall_into_automatic_groups() {
+    let dir = TempDir::new("groups");
+    write_tagged(&dir.0.join("a.wav"), "One", "A", "Tech House", "124", "8A");
+    write_tagged(&dir.0.join("b.wav"), "Two", "B", "tech house", "126", "9A");
+    write_tagged(&dir.0.join("c.wav"), "Three", "C", "Disco", "110", "3B");
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let all = library.tracks(&TrackQuery::default()).unwrap();
+    let id = |title: &str| all.iter().find(|t| t.title == title).unwrap().id;
+    // Automatic groups, by genre (however it is capitalised) and energy.
+    library.store_structure(id("One"), Some(8), &[]).unwrap();
+    let groups = library.groups().unwrap();
+    let count = |group: Group| groups.iter().find(|g| g.group == group).map(|g| g.count);
+    assert_eq!(count(Group::Genre("Tech House".into())), Some(2));
+    assert_eq!(count(Group::Genre("Disco".into())), Some(1));
+    assert_eq!(count(Group::Energy(EnergyBand::High)), Some(1));
+    let tech = TrackQuery {
+        group: Some(Group::Genre("TECH HOUSE".into())),
+        ..Default::default()
+    };
+    assert_eq!(library.tracks(&tech).unwrap().len(), 2);
+}
+
+#[test]
+fn years_are_read_and_filled_in_for_older_libraries() {
+    let dir = TempDir::new("years");
+    let path = dir.0.join("a.wav");
+    write_tagged(&path, "Old One", "A", "", "", "");
+    let mut tag = Tag::new(TagType::Id3v2);
+    tag.set_title("Old One".into());
+    // ID3v2 keeps the date in TDRC, as most taggers write it.
+    tag.insert_text(ItemKey::RecordingDate, "1997-05-01".into());
+    tag.save_to_path(&path, WriteOptions::default()).unwrap();
+
+    let db = dir.0.join("library.db");
+    let mut library = Library::open(&db).unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let track = library.tracks(&TrackQuery::default()).unwrap().remove(0);
+    assert_eq!(track.year, Some(1997));
+    library.store_tempo(track.id, 3, None).unwrap();
+
+    // A library from before years were read gets them on its next scan,
+    // without the file counting as changed or needing analysis again.
+    drop(library);
+    let raw = rusqlite::Connection::open(&db).unwrap();
+    raw.execute_batch("UPDATE tracks SET year = NULL, year_checked = 0")
+        .unwrap();
+    drop(raw);
+    let mut library = Library::open(&db).unwrap();
+    let summary = library.scan(source.id, |_| {}).unwrap();
+    assert_eq!(summary.unchanged, 1);
+    let track = library.tracks(&TrackQuery::default()).unwrap().remove(0);
+    assert_eq!(track.year, Some(1997));
+    assert!(library.pending_tempo_analysis(3).unwrap().is_empty());
+    let decade = TrackQuery {
+        group: Some(Group::Decade(1990)),
+        ..Default::default()
+    };
+    assert_eq!(library.tracks(&decade).unwrap().len(), 1);
 }
 
 #[test]

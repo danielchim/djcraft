@@ -9,6 +9,7 @@ mod export;
 mod flow;
 mod import;
 pub mod lookup;
+mod organise;
 mod scan;
 mod tags;
 mod watch;
@@ -27,11 +28,12 @@ pub use flow::{
     MIN_CLIP_SPEED,
 };
 pub use import::{ImportSummary, ImportedPlaylist, read_playlists};
+pub use organise::{EnergyBand, Group, GroupCount};
 pub use scan::{Artwork, ScanProgress, ScanSummary, TrackEdit, read_artwork};
 pub use tags::{AlignOptions, ApplySummary, Cleanup, Placement, PlannedChange, TagBatch, TagField};
 pub use watch::FolderWatcher;
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 /// A measured tempo is shown only when the analysis was at least this sure
 /// of it. Below that (mixes with several tempos, music with no clear beat)
@@ -187,6 +189,10 @@ pub struct Track {
     pub camelot: Option<Camelot>,
     /// Energy of the track as a whole, 1 to 10, once analysed.
     pub energy: Option<u8>,
+    /// The year in the file's tags.
+    pub year: Option<i32>,
+    /// When the track joined the library, in seconds since 1970.
+    pub added_at: i64,
 }
 
 /// A point in a track where a new section begins.
@@ -253,6 +259,8 @@ pub struct TrackQuery {
     pub search: String,
     /// Only tracks in one of these keys. Empty means any key.
     pub keys: Vec<Camelot>,
+    /// Only tracks in this automatic group.
+    pub group: Option<Group>,
 }
 
 /// One connection to the library database. Open one per thread; they share
@@ -471,6 +479,17 @@ impl Library {
                  );
                  CREATE INDEX tag_history_batch ON tag_history (batch_id);
                  PRAGMA user_version = 11;
+                 COMMIT;",
+            )?;
+        }
+        if version < 12 {
+            // The year from the tags. `year_checked` marks tracks whose tags
+            // have been looked at for it, so older libraries can catch up.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE tracks ADD COLUMN year INTEGER;
+                 ALTER TABLE tracks ADD COLUMN year_checked INTEGER NOT NULL DEFAULT 0;
+                 PRAGMA user_version = 12;
                  COMMIT;",
             )?;
         }
@@ -809,7 +828,8 @@ impl Library {
     pub fn tracks(&self, query: &TrackQuery) -> Result<Vec<Track>> {
         let mut sql = format!(
             "SELECT t.id, t.source_id, s.location, t.locator, t.title, t.artist, t.album,
-                    t.genre, t.duration, {bpm}, {key}, t.energy, s.name, s.kind
+                    t.genre, t.duration, {bpm}, {key}, t.energy, s.name, s.kind,
+                    t.year, t.added_at
              FROM tracks t JOIN sources s ON s.id = t.source_id
              LEFT JOIN playlist_tracks pt ON pt.track_id = t.id AND pt.playlist_id = ?2
              WHERE (?1 IS NULL OR t.source_id = ?1) AND (?2 IS NULL OR pt.track_id IS NOT NULL)
@@ -830,6 +850,11 @@ impl Library {
                 " AND (t.title LIKE ?{n} ESCAPE '\\' OR t.artist LIKE ?{n} ESCAPE '\\'
                    OR t.album LIKE ?{n} ESCAPE '\\' OR t.genre LIKE ?{n} ESCAPE '\\')"
             ));
+        }
+        if let Some(group) = &query.group {
+            let (condition, value) = group.sql(values.len() + 1);
+            sql.push_str(&condition);
+            values.extend(value);
         }
         sql.push_str(if query.playlist.is_some() {
             " ORDER BY pt.position"
@@ -856,6 +881,8 @@ impl Library {
                 energy: row.get(11)?,
                 source_name: row.get(12)?,
                 source_kind: source_kind(&row.get::<_, String>(13)?),
+                year: row.get(14)?,
+                added_at: row.get(15)?,
             })
         })?;
         let mut tracks: Vec<Track> = tracks.collect::<rusqlite::Result<_>>()?;
@@ -900,7 +927,7 @@ pub(crate) fn canonical(path: &Path) -> io::Result<PathBuf> {
     })
 }
 
-fn source_kind(kind: &str) -> SourceKind {
+pub(crate) fn source_kind(kind: &str) -> SourceKind {
     match kind {
         "files" => SourceKind::Files,
         _ => SourceKind::Folder,

@@ -131,7 +131,7 @@ impl Shell {
     }
 
     /// Looks up the beat grid of each deck's track in the library.
-    fn refresh_grids(&mut self, cx: &App) {
+    fn refresh_grids(&mut self, cx: &mut Context<Self>) {
         let library = self.library.read(cx);
         self.grids = self
             .deck_paths

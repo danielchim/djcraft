@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 use djcraft_analysis::TempoRange;
 use djcraft_library::lookup::Provider;
 use djcraft_library::{
-    AlignOptions, ApplySummary, Camelot, Cleanup, FolderWatcher, ImportSummary, Library,
-    PlannedChange, Playlist, Source, SourceKind, TempoResult, Track, TrackEdit, TrackQuery,
-    read_artwork, read_playlists,
+    AlignOptions, ApplySummary, Camelot, Cleanup, FolderWatcher, Group, GroupCount, ImportSummary,
+    Library, PlannedChange, Playlist, Source, SourceKind, TempoResult, Track, TrackEdit,
+    TrackQuery, read_artwork, read_playlists,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -153,11 +153,12 @@ enum Field {
     Bpm,
     Key,
     Energy,
+    Year,
     Time,
     Source,
 }
 
-const COLUMNS: [(Field, &str, f32); 9] = [
+const COLUMNS: [(Field, &str, f32); 10] = [
     (Field::Title, "Title", 260.),
     (Field::Artist, "Artist", 170.),
     (Field::Album, "Album", 170.),
@@ -165,6 +166,7 @@ const COLUMNS: [(Field, &str, f32); 9] = [
     (Field::Bpm, "BPM", 70.),
     (Field::Key, "Key", 60.),
     (Field::Energy, "Energy", 80.),
+    (Field::Year, "Year", 60.),
     (Field::Time, "Time", 70.),
     (Field::Source, "Source", 110.),
 ];
@@ -332,6 +334,8 @@ struct TrackTable {
     playlists: Vec<Playlist>,
     /// The playlist being shown, if any.
     playlist: Option<i64>,
+    /// The columns shown, as places in [`COLUMNS`].
+    visible: Vec<usize>,
 }
 
 impl TrackTable {
@@ -342,7 +346,13 @@ impl TrackTable {
             sort: None,
             playlists: Vec::new(),
             playlist: None,
+            visible: (0..COLUMNS.len()).collect(),
         }
+    }
+
+    /// The field shown in a column of the table as it is now.
+    fn field(&self, col_ix: usize) -> Field {
+        COLUMNS[self.visible[col_ix]].0
     }
 
     /// Replaces the rows, keeping the user's chosen sort order.
@@ -374,8 +384,8 @@ impl TrackTable {
             (None, None) => Ordering::Equal,
         };
         let (field, descending) = match self.sort {
-            Some((column, ColumnSort::Ascending)) => (COLUMNS[column].0, false),
-            Some((column, ColumnSort::Descending)) => (COLUMNS[column].0, true),
+            Some((column, ColumnSort::Ascending)) => (self.field(column), false),
+            Some((column, ColumnSort::Descending)) => (self.field(column), true),
             _ => (Field::Artist, false),
         };
         self.tracks.sort_by(|a, b| {
@@ -386,6 +396,7 @@ impl TrackTable {
                 Field::Genre => text(&a.genre, &b.genre),
                 Field::Bpm => optional(a.bpm, b.bpm),
                 Field::Energy => optional(a.energy.map(f64::from), b.energy.map(f64::from)),
+                Field::Year => optional(a.year.map(f64::from), b.year.map(f64::from)),
                 // Everything is local for now, so fall back to the folder.
                 Field::Source => text(&a.source_name, &b.source_name),
                 // Wheel order, with keys that could not be read last.
@@ -408,7 +419,7 @@ impl TrackTable {
 
 impl TableDelegate for TrackTable {
     fn columns_count(&self, _: &App) -> usize {
-        COLUMNS.len()
+        self.visible.len()
     }
 
     fn rows_count(&self, _: &App) -> usize {
@@ -416,10 +427,10 @@ impl TableDelegate for TrackTable {
     }
 
     fn column(&self, col_ix: usize, _: &App) -> Column {
-        let (field, name, width) = COLUMNS[col_ix];
+        let (field, name, width) = COLUMNS[self.visible[col_ix]];
         let column = Column::new(name, name).width(px(width)).sortable();
         match field {
-            Field::Bpm | Field::Energy | Field::Time => column.text_right(),
+            Field::Bpm | Field::Energy | Field::Year | Field::Time => column.text_right(),
             _ => column,
         }
     }
@@ -521,7 +532,7 @@ impl TableDelegate for TrackTable {
     ) -> impl IntoElement {
         let track = &self.tracks[row_ix];
         let decimals = bpm_decimals(cx);
-        let text: SharedString = match COLUMNS[col_ix].0 {
+        let text: SharedString = match self.field(col_ix) {
             Field::Title => track.title.clone().into(),
             Field::Artist => track.artist.clone().into(),
             Field::Album => track.album.clone().into(),
@@ -545,6 +556,11 @@ impl TableDelegate for TrackTable {
                 Some(key) => key.to_string().into(),
                 None => track.key.clone().unwrap_or_default().into(),
             },
+            Field::Year => track
+                .year
+                .map(|year| year.to_string())
+                .unwrap_or_default()
+                .into(),
             Field::Time => {
                 let seconds = track.duration_seconds.round() as u64;
                 format!("{}:{:02}", seconds / 60, seconds % 60).into()
@@ -605,6 +621,9 @@ pub struct LibraryView {
     /// Set when the library must be analysed again once the pass under way
     /// has stopped.
     reanalyse: bool,
+    /// The automatic group shown, in place of a source.
+    group: Option<Group>,
+    groups: Vec<GroupCount>,
     /// The key picked on the Camelot wheel.
     wheel_key: Option<Camelot>,
     key_counts: HashMap<Camelot, usize>,
@@ -709,6 +728,8 @@ impl LibraryView {
             watcher: None,
             tempo_range: TempoRange::default(),
             reanalyse: false,
+            group: None,
+            groups: Vec::new(),
             flow: (!compact).then(|| cx.new(|cx| crate::flow_view::FlowView::new(window, cx))),
             wheel_key: None,
             key_counts: HashMap::new(),
@@ -904,6 +925,10 @@ impl LibraryView {
                 .filter(|_| self.section == Section::Library || self.compact)
                 .map(|key| key.compatible().to_vec())
                 .unwrap_or_default(),
+            group: self
+                .group
+                .clone()
+                .filter(|_| !in_playlists && !self.compact),
         };
         let loaded = (|| {
             let tracks = if in_playlists && query.playlist.is_none() {
@@ -912,6 +937,9 @@ impl LibraryView {
                 library.tracks(&query)?
             };
             self.key_counts = library.key_counts()?;
+            if !self.compact {
+                self.groups = library.groups()?;
+            }
             Ok::<_, djcraft_library::Error>((library.sources()?, library.playlists()?, tracks))
         })();
         match loaded {
@@ -919,9 +947,8 @@ impl LibraryView {
                 self.sources = sources;
                 self.playlists = playlists.clone();
                 self.table.update(cx, |table, cx| {
-                    table
-                        .delegate_mut()
-                        .set_tracks(tracks, playlists, query.playlist);
+                    let table = table.delegate_mut();
+                    table.set_tracks(tracks, playlists, query.playlist);
                     cx.notify();
                 });
             }
@@ -1631,6 +1658,14 @@ impl LibraryView {
     fn select(&mut self, source: Option<i64>, cx: &mut Context<Self>) {
         self.section = Section::Library;
         self.selected = source;
+        self.group = None;
+        self.reload(cx);
+    }
+
+    fn select_group(&mut self, group: Group, cx: &mut Context<Self>) {
+        self.section = Section::Library;
+        self.selected = None;
+        self.group = Some(group);
         self.reload(cx);
     }
 
@@ -1950,7 +1985,9 @@ impl LibraryView {
                 .px_2()
                 .rounded_md()
                 .text_sm()
-                .when(self.selected == source, |this| this.bg(hover))
+                .when(self.selected == source && self.group.is_none(), |this| {
+                    this.bg(hover)
+                })
                 .hover(|style| style.bg(hover))
                 .child(Icon::new(icon).small().text_color(muted))
                 .child(div().flex_1().min_w_0().truncate().child(label))
@@ -2035,6 +2072,55 @@ impl LibraryView {
                                 .child(playlist.name.clone()),
                         )
                         .on_click(cx.listener(move |this, _, _, cx| this.open_playlist(id, cx)))
+                }))
+            })
+            .when(!self.compact && !self.groups.is_empty(), |this| {
+                this.child(
+                    div()
+                        .px_2()
+                        .pt_2()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("Groups"),
+                )
+                .children(self.groups.iter().enumerate().map(|(index, group)| {
+                    let chosen = group.group.clone();
+                    let selected = self.group.as_ref() == Some(&group.group);
+                    let icon = match group.group {
+                        Group::Genre(_) => IconName::Tag,
+                        Group::Energy(_) => IconName::Zap,
+                        Group::Decade(_) => IconName::Calendar,
+                    };
+                    div()
+                        .id(("group", index))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .h(px(28.))
+                        .px_2()
+                        .rounded_md()
+                        .text_sm()
+                        .when(selected, |this| this.bg(hover))
+                        .hover(|style| style.bg(hover))
+                        .child(Icon::new(icon).small().text_color(muted))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(group.group.label()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(group.count.to_string()),
+                        )
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.select_group(chosen.clone(), cx)
+                            }),
+                        )
                 }))
             })
             .when(!self.compact, |this| {
