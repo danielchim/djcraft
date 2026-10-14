@@ -1661,6 +1661,7 @@ name = "djcraft-library"
 version = "0.1.0"
 dependencies = [
  "lofty",
+ "notify",
  "roxmltree 0.21.1",
  "rusqlite",
  "serde",

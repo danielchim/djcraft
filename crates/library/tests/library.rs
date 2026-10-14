@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use djcraft_library::{
-    Camelot, ClipPlacement, CuePoint, ImportSummary, Library, ScanSummary, SourceKind, TempoResult,
-    TrackEdit, TrackQuery, read_artwork, read_playlists,
+    Camelot, ClipPlacement, CuePoint, FolderWatcher, ImportSummary, Library, ScanSummary,
+    SourceKind, TempoResult, TrackEdit, TrackQuery, read_artwork, read_playlists,
 };
 use lofty::config::WriteOptions;
 use lofty::tag::{Accessor, ItemKey, Tag, TagExt, TagType};
@@ -184,6 +184,58 @@ fn a_missing_folder_does_not_empty_the_library() {
     std::fs::remove_dir_all(&dir.0).unwrap();
     assert!(library.scan(source.id, |_| {}).is_err());
     assert_eq!(titles(&library, ""), ["a"]);
+}
+
+/// Waits for the watcher to report a change, for as long as a slow
+/// machine might take to deliver one.
+fn changed_soon(watcher: &FolderWatcher) -> Vec<i64> {
+    for _ in 0..200 {
+        let changed = watcher.take_changed(std::time::Duration::ZERO);
+        if !changed.is_empty() {
+            return changed;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Vec::new()
+}
+
+#[test]
+fn a_watched_folder_reports_added_and_removed_files() {
+    let dir = TempDir::new("watch");
+    std::fs::create_dir_all(dir.0.join("house")).unwrap();
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+
+    let mut watcher = FolderWatcher::new();
+    watcher.watch(source.id, &dir.0).unwrap();
+
+    write_wav(&dir.0.join("house").join("new.wav"));
+    assert_eq!(changed_soon(&watcher), [source.id]);
+    // Changes are held back while they are still coming in.
+    write_wav(&dir.0.join("house").join("newer.wav"));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(
+        watcher
+            .take_changed(std::time::Duration::from_secs(3600))
+            .is_empty()
+    );
+    assert_eq!(changed_soon(&watcher), [source.id]);
+    let summary = library.scan(source.id, |_| {}).unwrap();
+    assert_eq!(summary.added, 2);
+
+    // Late reports of the writes above must not pass for the removal.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    watcher.take_changed(std::time::Duration::ZERO);
+    std::fs::remove_file(dir.0.join("house").join("new.wav")).unwrap();
+    assert_eq!(changed_soon(&watcher), [source.id]);
+    assert_eq!(library.scan(source.id, |_| {}).unwrap().removed, 1);
+
+    watcher.unwatch(source.id);
+    write_wav(&dir.0.join("ignored.wav"));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(watcher.take_changed(std::time::Duration::ZERO).is_empty());
+    assert!(watcher.watch(source.id, &dir.0.join("missing")).is_err());
 }
 
 #[test]

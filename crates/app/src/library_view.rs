@@ -1,15 +1,15 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::f32::consts::TAU;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 use djcraft_library::lookup::{self, Provider, TrackMatch};
 use djcraft_library::{
-    Camelot, ImportSummary, Library, Playlist, Source, SourceKind, Track, TrackEdit, TrackQuery,
-    read_artwork, read_playlists,
+    Camelot, FolderWatcher, ImportSummary, Library, Playlist, Source, SourceKind, Track, TrackEdit,
+    TrackQuery, read_artwork, read_playlists,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -28,6 +28,11 @@ use gpui_kit::*;
 const SCAN_REFRESH: Duration = Duration::from_millis(400);
 /// How often it is refreshed while tracks are being analysed.
 const ANALYSIS_REFRESH: Duration = Duration::from_secs(2);
+/// How often watched folders are asked whether they changed.
+const WATCH_POLL: Duration = Duration::from_secs(1);
+/// How long a folder must be left alone before it is scanned, so that a
+/// copy in progress is scanned once, at its end.
+const WATCH_QUIET: Duration = Duration::from_secs(2);
 
 /// A section of the library, chosen from the rail on the left.
 #[derive(Clone, Copy, PartialEq)]
@@ -163,6 +168,8 @@ pub enum LibraryEvent {
     },
     /// A track was picked out in one of the compact browsers.
     Selected { id: i64 },
+    /// A scan finished, so the database may hold different tracks.
+    Changed,
 }
 
 /// A track being dragged out of a track list.
@@ -579,6 +586,8 @@ pub struct LibraryView {
     editing: bool,
     running_scans: usize,
     scan_counters: Arc<ScanCounters>,
+    /// Watches the folders for changes; `None` when that is switched off.
+    watcher: Option<FolderWatcher>,
     /// The key picked on the Camelot wheel.
     wheel_key: Option<Camelot>,
     key_counts: HashMap<Camelot, usize>,
@@ -682,6 +691,7 @@ impl LibraryView {
             editing: false,
             running_scans: 0,
             scan_counters: Arc::default(),
+            watcher: None,
             flow: (!compact).then(|| cx.new(|cx| crate::flow_view::FlowView::new(window, cx))),
             wheel_key: None,
             key_counts: HashMap::new(),
@@ -700,7 +710,58 @@ impl LibraryView {
             view.scan(source.id, cx);
         }
         view.analyse(cx);
+        if !compact {
+            view.poll_watcher(cx);
+        }
         view
+    }
+
+    /// Starts or stops watching the library's folders for changes.
+    pub fn set_watching(&mut self, on: bool) {
+        if on == self.watcher.is_some() {
+            return;
+        }
+        self.watcher = on.then(FolderWatcher::new);
+        for source in self.sources.clone() {
+            self.watch(&source);
+        }
+    }
+
+    fn watch(&mut self, source: &Source) {
+        let Some(watcher) = &mut self.watcher else {
+            return;
+        };
+        if source.kind == SourceKind::Folder {
+            // A folder that cannot be watched (an unplugged drive, say) is
+            // still scanned at start-up.
+            let _ = watcher.watch(source.id, Path::new(&source.location));
+        }
+    }
+
+    /// Scans watched folders once changes to them have settled, for as
+    /// long as the view lives.
+    fn poll_watcher(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(WATCH_POLL).await;
+                let alive = this.update(cx, |this, cx| {
+                    // Changes during a scan wait for it to finish.
+                    let changed = match &this.watcher {
+                        Some(watcher) if this.running_scans == 0 => {
+                            watcher.take_changed(WATCH_QUIET)
+                        }
+                        _ => Vec::new(),
+                    };
+                    for source_id in changed {
+                        this.scan(source_id, cx);
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Analyses tracks that have not been analysed yet, in the background,
@@ -1318,7 +1379,10 @@ impl LibraryView {
                         return;
                     };
                     match library.add_folder(&path) {
-                        Ok(source) => this.scan(source.id, cx),
+                        Ok(source) => {
+                            this.watch(&source);
+                            this.scan(source.id, cx);
+                        }
                         Err(error) => this.error = Some(error.to_string().into()),
                     }
                 }
@@ -1335,6 +1399,9 @@ impl LibraryView {
         };
         if let Err(error) = library.remove_source(id) {
             self.error = Some(error.to_string().into());
+        }
+        if let Some(watcher) = &mut self.watcher {
+            watcher.unwatch(id);
         }
         if self.selected == Some(id) {
             self.selected = None;
@@ -1366,6 +1433,10 @@ impl LibraryView {
                     this.error = Some(error.to_string().into());
                 }
                 this.reload(cx);
+                cx.emit(LibraryEvent::Changed);
+                if let (Section::Flow, Some(flow)) = (this.section, &this.flow) {
+                    flow.update(cx, |flow, cx| flow.refresh(cx));
+                }
                 // Whatever the scan found needs analysing.
                 if this.running_scans == 0 {
                     this.analyse(cx);

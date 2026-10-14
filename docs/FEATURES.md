@@ -40,8 +40,8 @@ Status key: `[ ]` to do, `[~]` in progress, `[x]` done.
 
 ### Sources
 
-- [~] Local files and folders, with watch-for-changes (folders are scanned at
-      start-up and when added; no live watching yet)
+- [x] Local files and folders, with watch-for-changes (watching has only
+      been tried on macOS)
 - [ ] Network shares
 - [ ] External sources as optional plugins (YouTube and similar through a
       user-installed `yt-dlp`); see Plugins

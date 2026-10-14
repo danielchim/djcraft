@@ -150,6 +150,7 @@ impl FlowView {
         cx.subscribe(&browser, |this, _, event: &LibraryEvent, cx| match event {
             LibraryEvent::Load { id, .. } => this.append_track(*id, cx),
             LibraryEvent::Selected { id } => this.play_track(*id, cx),
+            LibraryEvent::Changed => {}
         })
         .detach();
 

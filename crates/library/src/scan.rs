@@ -318,14 +318,17 @@ fn collect_audio_files(dir: &Path, files: &mut Vec<PathBuf>) {
         };
         if metadata.is_dir() {
             collect_audio_files(&path, files);
-        } else if path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| AUDIO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
-        {
+        } else if is_audio_file(&path) {
             files.push(path);
         }
     }
+}
+
+/// Whether a path has the extension of a format the library reads.
+pub(crate) fn is_audio_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| AUDIO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
 }
 
 /// Reads what the file's tags say. A file with no readable tags still gets

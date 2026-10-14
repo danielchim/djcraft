@@ -12,7 +12,8 @@ is the full plan, with the status of every item.
 ## What works today
 
 - **Library:** add folders, scan them in the background, and browse every
-  track in a searchable, sortable table. Tags are read from MP3, FLAC, WAV,
+  track in a searchable, sortable table. Folders are watched, so files you
+  add, change or remove show up while the app is open. Tags are read from MP3, FLAC, WAV,
   AIFF, M4A, OGG and Opus files.
 - **Playlists:** create playlists that mix tracks from any folder, and import
   them from a rekordbox XML export, a VirtualDJ folder, or M3U files.

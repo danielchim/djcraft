@@ -10,6 +10,7 @@ mod flow;
 mod import;
 pub mod lookup;
 mod scan;
+mod watch;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -26,6 +27,7 @@ pub use flow::{
 };
 pub use import::{ImportSummary, ImportedPlaylist, read_playlists};
 pub use scan::{Artwork, ScanProgress, ScanSummary, TrackEdit, read_artwork};
+pub use watch::FolderWatcher;
 
 const SCHEMA_VERSION: i64 = 8;
 
@@ -46,6 +48,8 @@ pub enum Error {
     Tags(String),
     /// An online lookup failed.
     Lookup(String),
+    /// A folder could not be watched for changes.
+    Watch(String),
 }
 
 impl fmt::Display for Error {
@@ -56,6 +60,7 @@ impl fmt::Display for Error {
             Error::Import(message) => write!(f, "cannot import: {message}"),
             Error::Tags(message) => write!(f, "cannot write tags: {message}"),
             Error::Lookup(message) => f.write_str(message),
+            Error::Watch(message) => write!(f, "cannot watch folder: {message}"),
             Error::NewerSchema(version) => write!(
                 f,
                 "library was created by a newer version (schema {version})"

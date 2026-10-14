@@ -70,6 +70,8 @@ pub struct Settings {
     pub start_tab: StartTab,
     /// Check the library's folders for changes when the app opens.
     pub scan_on_startup: bool,
+    /// Pick up changes to the library's folders while the app is open.
+    pub watch_folders: bool,
     /// Where "Look up" searches for a track's details.
     pub info_provider: Provider,
 }
@@ -80,6 +82,7 @@ impl Default for Settings {
             theme: ThemeChoice::default(),
             start_tab: StartTab::default(),
             scan_on_startup: true,
+            watch_folders: true,
             info_provider: Provider::default(),
         }
     }
@@ -124,6 +127,7 @@ mod tests {
             theme: ThemeChoice::Light,
             start_tab: StartTab::Library,
             scan_on_startup: false,
+            watch_folders: false,
             info_provider: Provider::Itunes,
         };
         settings.save(&dir).unwrap();
@@ -134,6 +138,7 @@ mod tests {
         let partial = Settings::load(&dir);
         assert_eq!(partial.theme, ThemeChoice::System);
         assert!(partial.scan_on_startup);
+        assert!(partial.watch_folders);
 
         std::fs::write(dir.join(FILE_NAME), "not json").unwrap();
         assert_eq!(Settings::load(&dir), Settings::default());

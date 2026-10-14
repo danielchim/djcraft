@@ -63,13 +63,18 @@ impl Shell {
         };
         let scan = settings.scan_on_startup;
         let library = cx.new(|cx| LibraryView::new(false, scan, window, cx));
-        library.update(cx, |view, cx| view.set_provider(settings.info_provider, cx));
+        library.update(cx, |view, cx| {
+            view.set_provider(settings.info_provider, cx);
+            view.set_watching(settings.watch_folders);
+        });
         cx.subscribe(&library, |this, _, event: &LibraryEvent, cx| match event {
             LibraryEvent::Load { path, deck, .. } => {
                 this.load_from_library(path, *deck);
                 this.show(Tab::Live, cx);
             }
             LibraryEvent::Selected { .. } => {}
+            // The browser under the decks reads the same database.
+            LibraryEvent::Changed => this.browser.update(cx, |view, cx| view.refresh(cx)),
         })
         .detach();
         let browser = cx.new(|cx| LibraryView::new(true, false, window, cx));
@@ -78,7 +83,7 @@ impl Shell {
                 this.load_from_library(path, *deck);
                 cx.notify();
             }
-            LibraryEvent::Selected { .. } => {}
+            LibraryEvent::Selected { .. } | LibraryEvent::Changed => {}
         })
         .detach();
         let mut shell = Self {
@@ -136,8 +141,10 @@ impl Shell {
                 SettingsEvent::Changed(settings) => {
                     this.settings = settings.clone();
                     this.settings.apply_theme(cx);
-                    this.library
-                        .update(cx, |view, cx| view.set_provider(settings.info_provider, cx));
+                    this.library.update(cx, |view, cx| {
+                        view.set_provider(settings.info_provider, cx);
+                        view.set_watching(settings.watch_folders);
+                    });
                     if let Err(error) = this.settings.save(&data_dir()) {
                         eprintln!("could not save settings: {error}");
                     }

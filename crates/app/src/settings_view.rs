@@ -311,6 +311,12 @@ impl SettingsView {
                         let checked = *checked;
                         this.change(|settings| settings.scan_on_startup = checked, cx);
                     }));
+                let watch = Switch::new("watch-folders")
+                    .checked(self.settings.watch_folders)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        let checked = *checked;
+                        this.change(|settings| settings.watch_folders = checked, cx);
+                    }));
                 let provider = self.dropdown(
                     "info-provider",
                     self.settings.info_provider,
@@ -336,6 +342,12 @@ impl SettingsView {
                             "Scan folders at start-up",
                             "Look for new, changed and removed files each time djcraft opens.",
                             scan,
+                            cx,
+                        ),
+                        self.row(
+                            "Watch folders for changes",
+                            "Add, update and remove tracks as files change while djcraft is open.",
+                            watch,
                             cx,
                         ),
                         self.row(
