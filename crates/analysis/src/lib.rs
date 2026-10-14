@@ -8,4 +8,4 @@ mod tempo;
 
 pub use key::{Key, detect_key};
 pub use structure::{Cue, MAX_CUES, Structure, detect_structure};
-pub use tempo::{Tempo, TempoRange, detect_tempo};
+pub use tempo::{BEATS_PER_BAR, Tempo, TempoRange, detect_tempo};

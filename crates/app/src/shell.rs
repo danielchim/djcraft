@@ -1,6 +1,9 @@
-use std::path::Path;
+use std::cell::Cell;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use djcraft_engine::{Engine, MAX_TEMPO, MIN_TEMPO};
+use djcraft_library::TempoResult;
 use djcraft_protocol::{Action, DeckAction, DeckState, Role};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -14,11 +17,12 @@ use gpui_kit::*;
 use crate::library_view::{LibraryEvent, LibraryView};
 use crate::settings::{Settings, StartTab, data_dir};
 use crate::settings_view::{SettingsEvent, SettingsView};
-use crate::waveform::waveform;
+use crate::waveform::{overview, waveform};
 
 const TOP_BAR_HEIGHT: Pixels = px(52.);
 const MAX_B2B_DJS: usize = 4;
 const TEMPO_STEP: f64 = 0.01;
+const OVERVIEW_HEIGHT: f32 = 36.;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Tab {
@@ -42,6 +46,13 @@ pub struct Shell {
     focus_settings: bool,
     engine: Option<Engine>,
     engine_error: Option<SharedString>,
+    /// The file last loaded onto each deck.
+    deck_paths: Vec<Option<PathBuf>>,
+    /// The beat grid of each deck's track, when it is a library track that
+    /// has been analysed.
+    grids: Vec<Option<TempoResult>>,
+    /// Where each deck's whole-track waveform is on screen, for seeking.
+    overview_areas: Vec<Rc<Cell<Bounds<Pixels>>>>,
 }
 
 impl Shell {
@@ -54,9 +65,7 @@ impl Shell {
     ) -> Self {
         let (engine, engine_error) = match Engine::new() {
             Ok(mut engine) => {
-                if let Some(dir) = dirs::cache_dir() {
-                    engine.set_cache_dir(dir.join("djcraft").join("waveforms"));
-                }
+                engine.set_cache_dir(crate::settings::waveform_dir());
                 (Some(engine), None)
             }
             Err(error) => (None, Some(error.to_string().into())),
@@ -70,17 +79,24 @@ impl Shell {
         cx.subscribe(&library, |this, _, event: &LibraryEvent, cx| match event {
             LibraryEvent::Load { path, deck, .. } => {
                 this.load_from_library(path, *deck);
+                this.refresh_grids(cx);
                 this.show(Tab::Live, cx);
             }
             LibraryEvent::Selected { .. } => {}
-            // The browser under the decks reads the same database.
-            LibraryEvent::Changed => this.browser.update(cx, |view, cx| view.refresh(cx)),
+            // The browser under the decks reads the same database, and a
+            // track on a deck may just have been analysed.
+            LibraryEvent::Changed => {
+                this.browser.update(cx, |view, cx| view.refresh(cx));
+                this.refresh_grids(cx);
+                cx.notify();
+            }
         })
         .detach();
         let browser = cx.new(|cx| LibraryView::new(true, false, window, cx));
         cx.subscribe(&browser, |this, _, event: &LibraryEvent, cx| match event {
             LibraryEvent::Load { path, deck, .. } => {
                 this.load_from_library(path, *deck);
+                this.refresh_grids(cx);
                 cx.notify();
             }
             LibraryEvent::Selected { .. } | LibraryEvent::Changed => {}
@@ -103,11 +119,25 @@ impl Shell {
             focus_settings: false,
             engine,
             engine_error,
+            deck_paths: vec![None; 2],
+            grids: vec![None; 2],
+            overview_areas: (0..2).map(|_| Rc::default()).collect(),
         };
         for (deck, path) in tracks.into_iter().enumerate() {
             shell.send(deck, DeckAction::Load { path });
         }
+        shell.refresh_grids(cx);
         shell
+    }
+
+    /// Looks up the beat grid of each deck's track in the library.
+    fn refresh_grids(&mut self, cx: &App) {
+        let library = self.library.read(cx);
+        self.grids = self
+            .deck_paths
+            .iter()
+            .map(|path| path.as_deref().and_then(|path| library.beat_grid_at(path)))
+            .collect();
     }
 
     pub fn show(&mut self, tab: Tab, cx: &mut Context<Self>) {
@@ -141,10 +171,13 @@ impl Shell {
                 SettingsEvent::Changed(settings) => {
                     this.settings = settings.clone();
                     this.settings.apply_theme(cx);
+                    cx.set_global(settings.clone());
                     this.library.update(cx, |view, cx| {
                         view.set_provider(settings.info_provider, cx);
-                        view.set_watching(settings.watch_folders);
+                        view.apply_settings(settings, cx);
                     });
+                    // How tempos are shown changes every view.
+                    cx.refresh_windows();
                     if let Err(error) = this.settings.save(&data_dir()) {
                         eprintln!("could not save settings: {error}");
                     }
@@ -182,6 +215,14 @@ impl Shell {
             deck: deck as u8,
             action,
         };
+        if let Action::Deck {
+            action: DeckAction::Load { path },
+            ..
+        } = &action
+            && let Some(slot) = self.deck_paths.get_mut(deck)
+        {
+            *slot = Some(PathBuf::from(path));
+        }
         if let Err(reason) = engine.apply(Role::Host, action) {
             eprintln!("action rejected: {reason:?}");
         }
@@ -383,6 +424,12 @@ impl Shell {
             (None, None) => ("No track loaded".into(), String::new()),
         };
         let track = self.engine.as_ref().and_then(|engine| engine.track(index));
+        let grid = self.grids.get(index).copied().flatten();
+        let area = self.overview_areas[index].clone();
+        let duration = state
+            .track
+            .as_ref()
+            .map_or(1., |track| track.duration_seconds.max(0.001));
         let tempo = state.tempo;
         let key_lock = state.key_lock;
         let playing = state.playing;
@@ -414,6 +461,7 @@ impl Shell {
                             let path = path.to_string_lossy().into_owned();
                             this.update(cx, |this, cx| {
                                 this.send(index, DeckAction::Load { path });
+                                this.refresh_grids(cx);
                                 cx.notify();
                             })
                             .ok();
@@ -502,10 +550,47 @@ impl Shell {
                     .child(div().flex_1().min_w_0().truncate().child(title))
                     .child(div().text_sm().child(time)),
             )
+            .child(
+                div()
+                    .id(("overview", index))
+                    .relative()
+                    .h(px(OVERVIEW_HEIGHT))
+                    .rounded_md()
+                    .bg(theme.secondary.opacity(0.5))
+                    .overflow_hidden()
+                    .when_some(track, |this, track| {
+                        this.child(overview(
+                            track.clone(),
+                            state.position_seconds / duration,
+                            area.clone(),
+                            theme.primary.opacity(0.5),
+                            theme.muted_foreground,
+                            theme.foreground,
+                        ))
+                    })
+                    // A click anywhere along the whole track jumps there.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            let area = this.overview_areas[index].get();
+                            let width = area.size.width.as_f32().max(1.);
+                            let fraction =
+                                ((event.position.x - area.origin.x).as_f32() / width).clamp(0., 1.);
+                            this.send(
+                                index,
+                                DeckAction::Seek {
+                                    seconds: fraction as f64 * duration,
+                                },
+                            );
+                            cx.notify();
+                        }),
+                    ),
+            )
             .child(div().flex_1().min_h_0().when_some(track, |this, track| {
                 this.child(waveform(
                     track.clone(),
                     state.position_seconds,
+                    grid,
                     theme.muted_foreground,
                     theme.primary,
                     theme.foreground,

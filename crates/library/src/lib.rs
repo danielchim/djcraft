@@ -29,7 +29,7 @@ pub use import::{ImportSummary, ImportedPlaylist, read_playlists};
 pub use scan::{Artwork, ScanProgress, ScanSummary, TrackEdit, read_artwork};
 pub use watch::FolderWatcher;
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 /// A measured tempo is shown only when the analysis was at least this sure
 /// of it. Below that (mixes with several tempos, music with no clear beat)
@@ -39,6 +39,59 @@ const MIN_TEMPO_CONFIDENCE: f64 = 0.1;
 /// well. Below that (drum tracks, speech, music that changes key) the track
 /// is left without one.
 const MIN_KEY_CONFIDENCE: f64 = 0.5;
+
+/// SQL for the tempo a track is listed with, over `tracks t`: a tempo typed
+/// in by hand, else a trustworthy measurement, else the tags' tempo. With
+/// [`KeepTagged::tempo`], the tags' tempo comes before the measurement.
+fn shown_bpm_sql() -> String {
+    format!(
+        "CASE WHEN t.bpm_manual = 0 AND t.tempo_confidence >= {MIN_TEMPO_CONFIDENCE}
+                   AND NOT (t.bpm IS NOT NULL AND {keep})
+              THEN t.tempo_bpm ELSE t.bpm END",
+        keep = option_sql("keep_tagged_tempo", KeepTagged::default().tempo),
+    )
+}
+
+/// SQL for the key a track is listed with, over `tracks t`: a key typed in
+/// by hand, else the tags' key or a trustworthy detected one, in the order
+/// [`KeepTagged::key`] sets.
+fn shown_key_sql() -> String {
+    let detected =
+        format!("CASE WHEN t.key_confidence >= {MIN_KEY_CONFIDENCE} THEN t.key_detected END");
+    format!(
+        "CASE WHEN t.key_manual = 1 OR {keep} THEN COALESCE(t.key, {detected})
+              ELSE COALESCE({detected}, t.key) END",
+        keep = option_sql("keep_tagged_key", KeepTagged::default().key),
+    )
+}
+
+fn option_sql(name: &str, default: bool) -> String {
+    format!(
+        "COALESCE((SELECT value FROM options WHERE name = '{name}'), {})",
+        default as i64
+    )
+}
+
+/// Whether what a file's tags say about its tempo and key is listed in
+/// place of what analysis measured. Either way, the measurement is kept,
+/// and a beat grid always comes from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeepTagged {
+    pub tempo: bool,
+    pub key: bool,
+}
+
+impl Default for KeepTagged {
+    /// Measured tempos are usually more precise than tagged ones, while a
+    /// key in the tags has often been set with care, by the user or by
+    /// another program.
+    fn default() -> Self {
+        Self {
+            tempo: false,
+            key: true,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -155,8 +208,27 @@ pub struct KeyResult {
 pub struct TempoResult {
     pub bpm: f64,
     pub first_beat_seconds: f64,
+    /// Which of the first four beats starts a bar, counting the first beat
+    /// as 0.
+    pub downbeat: u8,
     /// 0.0 to 1.0.
     pub confidence: f64,
+}
+
+impl TempoResult {
+    pub fn beat_seconds(&self) -> f64 {
+        60.0 / self.bpm
+    }
+
+    /// The length of one bar, taking four beats to the bar.
+    pub fn bar_seconds(&self) -> f64 {
+        4.0 * self.beat_seconds()
+    }
+
+    /// Time of the first beat that starts a bar.
+    pub fn first_bar_seconds(&self) -> f64 {
+        self.first_beat_seconds + self.downbeat as f64 * self.beat_seconds()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -360,7 +432,62 @@ impl Library {
                  COMMIT;",
             )?;
         }
+        if version < 10 {
+            // Which beat starts a bar; options that change how tracks are
+            // listed, shared by every connection; and a mark for a key the
+            // user typed in, which then stands over any detected one.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE tracks ADD COLUMN tempo_downbeat INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE tracks ADD COLUMN key_manual INTEGER NOT NULL DEFAULT 0;
+                 CREATE TABLE options (
+                     name TEXT PRIMARY KEY,
+                     value INTEGER NOT NULL
+                 );
+                 PRAGMA user_version = 10;
+                 COMMIT;",
+            )?;
+        }
         Ok(Self { conn })
+    }
+
+    pub fn keep_tagged(&self) -> Result<KeepTagged> {
+        let option = |name: &str, default: bool| -> Result<bool> {
+            Ok(self
+                .conn
+                .query_row("SELECT value FROM options WHERE name = ?1", [name], |row| {
+                    row.get(0)
+                })
+                .optional()?
+                .unwrap_or(default))
+        };
+        let default = KeepTagged::default();
+        Ok(KeepTagged {
+            tempo: option("keep_tagged_tempo", default.tempo)?,
+            key: option("keep_tagged_key", default.key)?,
+        })
+    }
+
+    pub fn set_keep_tagged(&self, keep: KeepTagged) -> Result<()> {
+        for (name, on) in [
+            ("keep_tagged_tempo", keep.tempo),
+            ("keep_tagged_key", keep.key),
+        ] {
+            self.conn.execute(
+                "INSERT INTO options (name, value) VALUES (?1, ?2)
+                 ON CONFLICT (name) DO UPDATE SET value = excluded.value",
+                params![name, on],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Marks every track as needing analysis again, as after a change to how
+    /// it is done. Returns how many there are.
+    pub fn reset_analysis(&self) -> Result<usize> {
+        Ok(self
+            .conn
+            .execute("UPDATE tracks SET tempo_version = NULL", [])?)
     }
 
     /// Tracks whose tempo has not been analysed by this `version` of the
@@ -386,13 +513,14 @@ impl Library {
     pub fn store_tempo(&self, id: i64, version: i64, tempo: Option<TempoResult>) -> Result<()> {
         self.conn.execute(
             "UPDATE tracks SET tempo_bpm = ?2, tempo_first_beat = ?3, tempo_confidence = ?4,
-                               tempo_version = ?5
+                               tempo_downbeat = ?5, tempo_version = ?6
              WHERE id = ?1",
             params![
                 id,
                 tempo.map(|t| t.bpm),
                 tempo.map(|t| t.first_beat_seconds),
                 tempo.map(|t| t.confidence),
+                tempo.map_or(0, |t| t.downbeat),
                 version
             ],
         )?;
@@ -477,18 +605,48 @@ impl Library {
         Ok(cues.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// The beat grid measured for a track: its tempo and first beat.
+    /// The library track stored at `path`, if there is one. The path may
+    /// go through a link (such as `/tmp` on macOS); folders are stored by
+    /// their real path.
+    pub fn track_at(&self, path: &Path) -> Result<Option<i64>> {
+        let real = canonical(path).unwrap_or_else(|_| path.to_path_buf());
+        let path = real.as_path();
+        for source in self.sources()? {
+            let locator = match source.kind {
+                SourceKind::Folder => match path.strip_prefix(&source.location) {
+                    Ok(relative) => relative.to_string_lossy().into_owned(),
+                    Err(_) => continue,
+                },
+                SourceKind::Files => path.to_string_lossy().into_owned(),
+            };
+            let id = self
+                .conn
+                .query_row(
+                    "SELECT id FROM tracks WHERE source_id = ?1 AND locator = ?2",
+                    params![source.id, locator],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if id.is_some() {
+                return Ok(id);
+            }
+        }
+        Ok(None)
+    }
+
+    /// The beat grid measured for a track: its tempo, first beat and bars.
     pub fn beat_grid(&self, id: i64) -> Result<Option<TempoResult>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT tempo_bpm, tempo_first_beat, tempo_confidence FROM tracks
+                "SELECT tempo_bpm, tempo_first_beat, tempo_confidence, tempo_downbeat FROM tracks
                  WHERE id = ?1 AND tempo_bpm IS NOT NULL AND tempo_confidence >= ?2",
                 params![id, MIN_TEMPO_CONFIDENCE],
                 |row| {
                     Ok(TempoResult {
                         bpm: row.get(0)?,
                         first_beat_seconds: row.get(1)?,
+                        downbeat: row.get(3)?,
                         confidence: row.get(2)?,
                     })
                 },
@@ -623,25 +781,18 @@ impl Library {
     /// Lists tracks, ordered by artist and then title, or in playlist order
     /// when the query names a playlist.
     pub fn tracks(&self, query: &TrackQuery) -> Result<Vec<Track>> {
-        let mut sql = String::from(
+        let mut sql = format!(
             "SELECT t.id, t.source_id, s.location, t.locator, t.title, t.artist, t.album,
-                    t.genre, t.duration,
-                    CASE WHEN t.bpm_manual = 0 AND t.tempo_confidence >= ?3
-                         THEN t.tempo_bpm ELSE t.bpm END,
-                    COALESCE(t.key, CASE WHEN t.key_confidence >= ?5 THEN t.key_detected END),
-                    t.energy, s.name, s.kind
+                    t.genre, t.duration, {bpm}, {key}, t.energy, s.name, s.kind
              FROM tracks t JOIN sources s ON s.id = t.source_id
              LEFT JOIN playlist_tracks pt ON pt.track_id = t.id AND pt.playlist_id = ?2
              WHERE (?1 IS NULL OR t.source_id = ?1) AND (?2 IS NULL OR pt.track_id IS NOT NULL)
-               AND (?4 IS NULL OR t.id = ?4)",
+               AND (?3 IS NULL OR t.id = ?3)",
+            bpm = shown_bpm_sql(),
+            key = shown_key_sql(),
         );
-        let mut values: Vec<rusqlite::types::Value> = vec![
-            query.source.into(),
-            query.playlist.into(),
-            MIN_TEMPO_CONFIDENCE.into(),
-            query.id.into(),
-            MIN_KEY_CONFIDENCE.into(),
-        ];
+        let mut values: Vec<rusqlite::types::Value> =
+            vec![query.source.into(), query.playlist.into(), query.id.into()];
         for word in query.search.split_whitespace() {
             let escaped = word
                 .replace('\\', "\\\\")
@@ -694,12 +845,10 @@ impl Library {
 
     /// How many tracks the library has in each key.
     pub fn key_counts(&self) -> Result<HashMap<Camelot, usize>> {
-        let mut statement = self.conn.prepare(
-            "SELECT COALESCE(key, CASE WHEN key_confidence >= ?1 THEN key_detected END)
-             FROM tracks",
-        )?;
-        let keys =
-            statement.query_map([MIN_KEY_CONFIDENCE], |row| row.get::<_, Option<String>>(0))?;
+        let mut statement = self
+            .conn
+            .prepare(&format!("SELECT {} FROM tracks t", shown_key_sql()))?;
+        let keys = statement.query_map([], |row| row.get::<_, Option<String>>(0))?;
         let mut counts = HashMap::new();
         for key in keys {
             if let Some(key) = key?.as_deref().and_then(Camelot::parse) {

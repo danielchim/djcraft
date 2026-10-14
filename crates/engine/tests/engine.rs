@@ -426,3 +426,32 @@ fn a_cached_waveform_is_complete_as_soon_as_the_track_opens() {
     std::fs::remove_file(&moved).unwrap();
     std::fs::remove_dir_all(&cache).unwrap();
 }
+
+#[test]
+fn a_waveform_cached_at_one_rate_serves_another() {
+    // Loud for the first half, quiet for the second.
+    let mono: Vec<f32> = sine(440.0, 10.0, 44_100)
+        .chunks(2)
+        .enumerate()
+        .map(|(i, f)| if i < 220_500 { f[0] } else { f[0] * 0.25 })
+        .collect();
+    let path = write_wav("rates", 44_100, &mono);
+    let cache = std::env::temp_dir().join(format!("djcraft-rates-{}", std::process::id()));
+
+    // Analysis decodes at a low rate; the decks play at a high one.
+    let analysed = Track::decode_cached(&path, 22_050, Some(&cache)).unwrap();
+    assert!(analysed.is_complete());
+    Track::load(&path, 48_000, Some(&cache), |track| {
+        assert!(!track.is_complete());
+        let peaks = track.peak_count();
+        assert_eq!(peaks, (480_000usize).div_ceil(track.frames_per_peak()));
+        assert!(track.frames().abs_diff(480_000) <= 1);
+        let (loud, quiet) = (track.peak(peaks / 4), track.peak(peaks * 3 / 4));
+        assert!((loud - analysed.peak(analysed.peak_count() / 4)).abs() < 0.01);
+        assert!((quiet * 4.0 - loud).abs() < 0.02, "{loud} then {quiet}");
+    })
+    .unwrap();
+
+    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_dir_all(&cache).unwrap();
+}

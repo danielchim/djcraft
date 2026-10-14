@@ -5,7 +5,6 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use djcraft_engine::Engine;
@@ -27,6 +26,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::library_view::{DraggedTrack, LibraryEvent, LibraryView, key_colour, wheel_display};
+use crate::waveform::overview;
 
 const LANE_HEIGHT: f32 = 56.;
 const RULER_HEIGHT: f32 = 22.;
@@ -306,9 +306,7 @@ impl FlowView {
         if self.player.is_none() {
             match Engine::new() {
                 Ok(mut player) => {
-                    if let Some(dir) = dirs::cache_dir() {
-                        player.set_cache_dir(dir.join("djcraft").join("waveforms"));
-                    }
+                    player.set_cache_dir(crate::settings::waveform_dir());
                     self.player = Some(player);
                 }
                 Err(error) => {
@@ -983,7 +981,9 @@ impl FlowView {
                     ))
                     .child(chip(
                         "BPM",
-                        track.bpm.map_or_else(unknown, |bpm| format!("{bpm:.0}")),
+                        track.bpm.map_or_else(unknown, |bpm| {
+                            crate::settings::format_bpm(bpm, crate::library_view::bpm_decimals(cx))
+                        }),
                     ))
                     .child(
                         div()
@@ -1510,17 +1510,16 @@ fn snap_speed(speed: f64, context: &DragContext) -> f64 {
 
 /// The length of one bar, taking four beats to the bar.
 fn bar_seconds(grid: TempoResult) -> f64 {
-    4. * 60. / grid.bpm
+    grid.bar_seconds()
 }
 
-/// The nearest bar line to a position in a track. Bars are counted from the
-/// first beat, since which beat starts a bar is not known. Without a beat
-/// grid the position is returned to the nearest tenth of a second.
+/// The nearest bar line to a position in a track. Without a beat grid the
+/// position is returned to the nearest tenth of a second.
 fn snap_to_bar(seconds: f64, grid: Option<TempoResult>) -> f64 {
     match grid {
         Some(grid) => {
-            let bar = bar_seconds(grid);
-            grid.first_beat_seconds + ((seconds - grid.first_beat_seconds) / bar).round() * bar
+            let (first, bar) = (grid.first_bar_seconds(), bar_seconds(grid));
+            first + ((seconds - first) / bar).round() * bar
         }
         None => (seconds * 10.).round() / 10.,
     }
@@ -1585,58 +1584,6 @@ impl Render for FlowView {
     }
 }
 
-/// A track's whole waveform, with the part already played in another colour
-/// and a line at the playing position.
-fn overview(
-    track: Arc<djcraft_engine::Track>,
-    played_fraction: f64,
-    area: Rc<Cell<Bounds<Pixels>>>,
-    played: Hsla,
-    upcoming: Hsla,
-    playhead: Hsla,
-) -> impl IntoElement {
-    const COLUMN: f32 = 2.;
-    canvas(
-        move |bounds, _, _| area.set(bounds),
-        move |bounds, _, window, _| {
-            let (width, height) = (bounds.size.width.as_f32(), bounds.size.height.as_f32());
-            // Peaks arrive as the track decodes, so the waveform fills in.
-            let total = (track.frames() / track.frames_per_peak()).max(1) as f32;
-            let ready = track.peak_count();
-            let columns = (width / COLUMN).ceil() as usize;
-            let played_x = played_fraction as f32 * width;
-            for column in 0..columns {
-                let x = column as f32 * COLUMN;
-                let from = (x / width * total) as usize;
-                let to = (((x + COLUMN) / width * total) as usize)
-                    .max(from + 1)
-                    .min(ready);
-                if from >= to {
-                    break;
-                }
-                let peak = (from..to).fold(0f32, |peak, i| peak.max(track.peak(i)));
-                let bar = (peak * height).max(1.);
-                window.paint_quad(fill(
-                    Bounds::new(
-                        bounds.origin + point(px(x), px((height - bar) / 2.)),
-                        size(px(COLUMN - 0.5), px(bar)),
-                    ),
-                    if x < played_x { played } else { upcoming },
-                ));
-            }
-            window.paint_quad(fill(
-                Bounds::new(
-                    bounds.origin + point(px(played_x), px(0.)),
-                    size(px(2.), px(height)),
-                ),
-                playhead,
-            ));
-        },
-    )
-    .absolute()
-    .size_full()
-}
-
 #[cfg(test)]
 mod tests {
     // Not `super::*`: that would bring in GPUI's own `test` attribute.
@@ -1645,10 +1592,11 @@ mod tests {
     use djcraft_library::{ClipPlacement, CuePoint};
 
     #[test]
-    fn positions_snap_to_bars_from_the_first_beat() {
+    fn positions_snap_to_bar_lines() {
         let grid = Some(TempoResult {
             bpm: 120.,
             first_beat_seconds: 0.5,
+            downbeat: 0,
             confidence: 1.,
         });
         // At 120 BPM a bar lasts two seconds: 0.5, 2.5, 4.5, ...
@@ -1657,6 +1605,13 @@ mod tests {
         assert_eq!(snap_to_bar(3.4, grid), 2.5);
         assert_eq!(snap_to_bar(3.6, grid), 4.5);
         assert_eq!(snap_to_bar(7.26, None), 7.3);
+        // When the bar starts on the second beat, lines fall half a second on.
+        let later = grid.map(|grid| TempoResult {
+            downbeat: 1,
+            ..grid
+        });
+        assert_eq!(snap_to_bar(0.9, later), 1.0);
+        assert_eq!(snap_to_bar(3.4, later), 3.0);
         assert_eq!(clock(125.4), "2:05");
 
         // A cue point within reach wins over the bar line.
@@ -1685,6 +1640,7 @@ mod tests {
             grid: Some(TempoResult {
                 bpm: 120.,
                 first_beat_seconds: 0.,
+                downbeat: 0,
                 confidence: 1.,
             }),
             cues: &[],

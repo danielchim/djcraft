@@ -5,6 +5,7 @@
 //! so the cues trace the shape of the track: intro, build, drop, break.
 
 use crate::Tempo;
+use crate::tempo::BEATS_PER_BAR;
 
 /// The most cue points a track is given.
 pub const MAX_CUES: usize = 8;
@@ -42,8 +43,7 @@ pub struct Structure {
     pub cues: Vec<Cue>,
 }
 
-/// Finds a track's sections. With a tempo, cue points fall on bar lines
-/// counted from the first beat; without one, on a two-second grid. Returns
+/// Finds a track's sections. With a tempo, cue points fall on bar lines; without one, on a two-second grid. Returns
 /// `None` for silence.
 pub fn detect_structure(
     samples: &[f32],
@@ -51,7 +51,10 @@ pub fn detect_structure(
     tempo: Option<Tempo>,
 ) -> Option<Structure> {
     let (bar_seconds, first_bar_seconds) = match tempo {
-        Some(tempo) => (4.0 * 60.0 / tempo.bpm, tempo.first_beat_seconds),
+        Some(tempo) => (
+            BEATS_PER_BAR as f64 * tempo.beat_seconds(),
+            tempo.first_bar_seconds(),
+        ),
         None => (FALLBACK_BAR_SECONDS, 0.0),
     };
     let frame = |seconds: f64| ((seconds * sample_rate as f64) as usize).min(samples.len());
@@ -167,6 +170,7 @@ mod tests {
         Some(Tempo {
             bpm: BPM,
             first_beat_seconds: FIRST_BEAT,
+            downbeat: 0,
             confidence: 1.0,
         })
     }

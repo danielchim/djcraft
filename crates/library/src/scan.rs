@@ -166,24 +166,34 @@ impl Library {
     /// Changes a track's details. They are written to the file's tags
     /// first, so the file stays the record of what the track is.
     pub fn edit_track(&self, id: i64, edit: &TrackEdit) -> Result<()> {
-        type Row = (i64, String, String, Option<f64>, Option<i64>);
-        let (source_id, root, locator, shown_bpm, tempo_version): Row = self.conn.query_row(
-            "SELECT t.source_id, s.location, t.locator,
-                        CASE WHEN t.bpm_manual = 0 AND t.tempo_confidence >= ?2
-                             THEN t.tempo_bpm ELSE t.bpm END,
-                        t.tempo_version
-                 FROM tracks t JOIN sources s ON s.id = t.source_id WHERE t.id = ?1",
-            params![id, crate::MIN_TEMPO_CONFIDENCE],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
-        )?;
+        type Row = (
+            i64,
+            String,
+            String,
+            Option<f64>,
+            Option<String>,
+            Option<i64>,
+        );
+        let (source_id, root, locator, shown_bpm, shown_key, tempo_version): Row =
+            self.conn.query_row(
+                &format!(
+                    "SELECT t.source_id, s.location, t.locator, {}, {}, t.tempo_version
+                     FROM tracks t JOIN sources s ON s.id = t.source_id WHERE t.id = ?1",
+                    crate::shown_bpm_sql(),
+                    crate::shown_key_sql(),
+                ),
+                [id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )?;
         let path = Path::new(&root).join(&locator);
         write_tags(&path, edit)?;
         let stamp = file_stamp(&path)
@@ -204,6 +214,16 @@ impl Library {
         if !same_bpm {
             self.conn
                 .execute("UPDATE tracks SET bpm_manual = 1 WHERE id = ?1", [id])?;
+        }
+        // The same for a key: one typed in stands over a detected one.
+        let typed_key = edit
+            .key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty());
+        if typed_key != shown_key.as_deref() {
+            self.conn
+                .execute("UPDATE tracks SET key_manual = 1 WHERE id = ?1", [id])?;
         }
         Ok(())
     }

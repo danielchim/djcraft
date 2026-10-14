@@ -4,6 +4,8 @@
 //! each short slice of time). The envelope's autocorrelation gives a rough
 //! tempo; folding the whole envelope at nearby beat lengths then finds the
 //! one tempo and phase at which beats stay lined up from start to finish.
+//! Last, the beat that starts each bar is found from where accents and
+//! changes in loudness fall.
 
 use rustfft::FftPlanner;
 use rustfft::num_complex::Complex;
@@ -29,6 +31,11 @@ const BASS_CONFIDENCE: f32 = 0.15;
 /// analysis window reaches it. Measured with synthetic drum hits at known
 /// positions (see the tests); real kicks vary by a few milliseconds.
 const ONSET_LAG_SECONDS: f64 = 0.015;
+/// Beats in a bar. Music in other time signatures still gets a beat grid,
+/// but its bar lines will be wrong.
+pub const BEATS_PER_BAR: usize = 4;
+/// How far either side of a beat its accent is looked for.
+const ACCENT_REACH_SECONDS: f64 = 0.015;
 
 /// The tempos a track may be reported at. A beat at 70 BPM is also a beat at
 /// 140, so the range decides which is meant.
@@ -51,10 +58,23 @@ impl Default for TempoRange {
 pub struct Tempo {
     pub bpm: f64,
     /// Time of the first beat. Later beats follow every `60 / bpm` seconds.
-    /// Which beat starts a bar is not worked out.
     pub first_beat_seconds: f64,
+    /// Which of the first [`BEATS_PER_BAR`] beats starts a bar, counting
+    /// the first beat as 0.
+    pub downbeat: u8,
     /// 0.0 to 1.0: how sharply onsets gather on the beat.
     pub confidence: f32,
+}
+
+impl Tempo {
+    pub fn beat_seconds(&self) -> f64 {
+        60.0 / self.bpm
+    }
+
+    /// Time of the first beat that starts a bar.
+    pub fn first_bar_seconds(&self) -> f64 {
+        self.first_beat_seconds + self.downbeat as f64 * self.beat_seconds()
+    }
 }
 
 /// Finds the tempo and beat positions of mono audio, assuming the tempo does
@@ -89,11 +109,95 @@ pub fn detect_tempo(samples: &[f32], sample_rate: u32, range: TempoRange) -> Opt
     let period = 60.0 / bpm;
     let window_centre = FRAME as f64 / 2.0 / sample_rate as f64;
     let first_beat = (phase * period + window_centre + ONSET_LAG_SECONDS).rem_euclid(period);
+    // Where on the envelope something heard at `seconds` shows.
+    let envelope_index = |seconds: f64| (seconds - window_centre - ONSET_LAG_SECONDS) * rate;
+    let downbeat = downbeat(
+        samples,
+        sample_rate,
+        &envelope,
+        envelope_index,
+        first_beat,
+        period,
+    );
     Some(Tempo {
         bpm,
         first_beat_seconds: first_beat,
+        downbeat,
         confidence: fold.confidence,
     })
+}
+
+/// Which of the first [`BEATS_PER_BAR`] beats starts a bar. Two things mark
+/// it: drums and new sounds tend to hit hardest at the start of a bar, and
+/// sections (a break, a drop) begin on one. Each candidate is scored on both,
+/// as a share of what the average candidate scores, so neither drowns out
+/// the other.
+fn downbeat(
+    samples: &[f32],
+    sample_rate: u32,
+    envelope: &[f32],
+    envelope_index: impl Fn(f64) -> f64,
+    first_beat: f64,
+    period: f64,
+) -> u8 {
+    let seconds = samples.len() as f64 / sample_rate as f64;
+    let beats = ((seconds - first_beat) / period).floor().max(0.0) as usize;
+    if beats < 2 * BEATS_PER_BAR {
+        return 0;
+    }
+    let beat_time = |beat: usize| first_beat + beat as f64 * period;
+
+    // How hard each beat hits.
+    let reach = (ACCENT_REACH_SECONDS / ENVELOPE_STEP_SECONDS).ceil() as usize;
+    let accent: Vec<f64> = (0..beats)
+        .map(|beat| {
+            let centre = envelope_index(beat_time(beat)).round();
+            if centre < 0.0 {
+                return 0.0;
+            }
+            let centre = centre as usize;
+            envelope
+                .get(centre.saturating_sub(reach)..(centre + reach + 1).min(envelope.len()))
+                .map_or(0.0, |near| near.iter().copied().fold(0.0, f32::max) as f64)
+        })
+        .collect();
+
+    // How loud each beat is, and how much that changes a bar either side.
+    let loudness: Vec<f64> = (0..beats)
+        .map(|beat| {
+            let from = (beat_time(beat) * sample_rate as f64) as usize;
+            let to = ((beat_time(beat + 1) * sample_rate as f64) as usize).min(samples.len());
+            let part = &samples[from.min(to)..to];
+            let power: f64 = part.iter().map(|s| (*s as f64).powi(2)).sum();
+            10.0 * (power / part.len().max(1) as f64 + 1e-12).log10()
+        })
+        .collect();
+    let mean = |from: usize, to: usize| loudness[from..to].iter().sum::<f64>() / (to - from) as f64;
+    let change: Vec<f64> = (0..beats)
+        .map(|beat| {
+            if beat < BEATS_PER_BAR || beat + BEATS_PER_BAR > beats {
+                return 0.0;
+            }
+            (mean(beat, beat + BEATS_PER_BAR) - mean(beat - BEATS_PER_BAR, beat)).abs()
+        })
+        .collect();
+
+    let scores = |values: &[f64]| -> [f64; BEATS_PER_BAR] {
+        let mut sums = [0.0; BEATS_PER_BAR];
+        for (beat, value) in values.iter().enumerate() {
+            sums[beat % BEATS_PER_BAR] += value;
+        }
+        let average = sums.iter().sum::<f64>() / BEATS_PER_BAR as f64;
+        if average > 0.0 {
+            sums.map(|sum| sum / average)
+        } else {
+            [0.0; BEATS_PER_BAR]
+        }
+    };
+    let (accent, change) = (scores(&accent), scores(&change));
+    (0..BEATS_PER_BAR)
+        .max_by(|a, b| (accent[*a] + change[*a]).total_cmp(&(accent[*b] + change[*b])))
+        .unwrap_or(0) as u8
 }
 
 /// Spectral flux: for each step, the total rise in level across frequency
@@ -327,6 +431,73 @@ mod tests {
         assert_tempo(174.0, 0.10);
         assert_tempo(90.5, 0.40);
         assert_tempo(122.37, 0.0);
+    }
+
+    /// The drum pattern with bars: a crash on the first beat of every bar,
+    /// the first bar starting on beat `downbeat`, and the hi-hats doubling
+    /// in level from the ninth bar on, as a new section would.
+    fn bars(bpm: f64, first_beat: f64, downbeat: usize, seconds: f64) -> Vec<f32> {
+        let mut samples = pattern(bpm, first_beat, seconds);
+        let period = 60.0 / bpm;
+        let mut noise = 0x1234_5678u32;
+        let mut random = move || {
+            noise ^= noise << 13;
+            noise ^= noise >> 17;
+            noise ^= noise << 5;
+            noise as f32 / u32::MAX as f32 - 0.5
+        };
+        let mut bar = 0;
+        loop {
+            let start = first_beat + (downbeat + bar * BEATS_PER_BAR) as f64 * period;
+            let at = (start * RATE as f64) as usize;
+            if at + RATE as usize >= samples.len() {
+                break;
+            }
+            for i in 0..RATE as usize / 2 {
+                let t = i as f32 / RATE as f32;
+                samples[at + i] += 0.3 * (-t * 8.0).exp() * random();
+            }
+            if bar >= 8 {
+                for beat in 0..BEATS_PER_BAR {
+                    let hat = ((start + (beat as f64 + 0.5) * period) * RATE as f64) as usize;
+                    for i in 0..400.min(samples.len().saturating_sub(hat)) {
+                        let t = i as f32 / RATE as f32;
+                        samples[hat + i] += 0.25 * (-t * 200.0).exp() * random();
+                    }
+                }
+            }
+            bar += 1;
+        }
+        samples
+    }
+
+    #[test]
+    fn finds_the_beat_that_starts_each_bar() {
+        for (bpm, first_beat, downbeat) in [
+            (128.0, 0.2, 0),
+            (124.0, 0.1, 1),
+            (174.0, 0.3, 2),
+            (100.0, 0.05, 3),
+        ] {
+            let tempo = detect_tempo(
+                &bars(bpm, first_beat, downbeat, 60.0),
+                RATE,
+                TempoRange::default(),
+            )
+            .unwrap();
+            // The grid may begin a beat later than the music if its first
+            // beat is too close to the start to measure.
+            let period = 60.0 / bpm;
+            let expected = first_beat + downbeat as f64 * period;
+            let error =
+                (tempo.first_bar_seconds() - expected).rem_euclid(BEATS_PER_BAR as f64 * period);
+            let error = error.min(BEATS_PER_BAR as f64 * period - error);
+            assert!(
+                error < 0.01,
+                "{bpm} BPM, downbeat {downbeat}: bar off by {error:.3} s"
+            );
+            assert!(tempo.first_bar_seconds() >= tempo.first_beat_seconds);
+        }
     }
 
     #[test]

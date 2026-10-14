@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, mpsc};
 
 use djcraft_analysis::{TempoRange, detect_key, detect_structure, detect_tempo};
@@ -10,8 +10,9 @@ use djcraft_engine::Track;
 use djcraft_library::{Camelot, CuePoint, KeyResult, Library, TempoResult};
 
 /// Raise this when the analysis changes enough that every track should be
-/// analysed again. Version 2 added energy and cue points; version 3, key.
-const ANALYSIS_VERSION: i64 = 3;
+/// analysed again. Version 2 added energy and cue points; version 3, key;
+/// version 4, bars and waveforms.
+const ANALYSIS_VERSION: i64 = 4;
 /// Tempo and key do not need treble, and a lower rate is quicker to decode.
 const ANALYSIS_RATE: u32 = 22_050;
 const MAX_WORKERS: usize = 4;
@@ -20,11 +21,20 @@ const MAX_WORKERS: usize = 4;
 pub struct Progress {
     pub done: AtomicUsize,
     pub total: AtomicUsize,
+    /// Set to stop the pass early. Tracks already analysed keep their
+    /// results; the rest stay pending.
+    pub cancel: AtomicBool,
 }
 
-/// Analyses every track that needs it and stores the results. Blocking, and
-/// busy on several threads; run it off the UI thread.
-pub fn analyse_pending(db_path: &Path, progress: &Progress) -> djcraft_library::Result<()> {
+/// Analyses every track that needs it and stores the results, saving each
+/// track's waveform in `waveform_dir` on the way. Blocking, and busy on
+/// several threads; run it off the UI thread.
+pub fn analyse_pending(
+    db_path: &Path,
+    waveform_dir: &Path,
+    range: TempoRange,
+    progress: &Progress,
+) -> djcraft_library::Result<()> {
     let mut library = Library::open(db_path)?;
     let pending = library.pending_tempo_analysis(ANALYSIS_VERSION)?;
     progress.done.store(0, Ordering::Relaxed);
@@ -47,11 +57,15 @@ pub fn analyse_pending(db_path: &Path, progress: &Progress) -> djcraft_library::
             let queue = &queue;
             scope.spawn(move || {
                 loop {
+                    if progress.cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
                     let next = queue.lock().ok().and_then(|mut queue| queue.pop_front());
                     let Some((id, path)) = next else {
                         break;
                     };
-                    if results.send((id, analyse(&path))).is_err() {
+                    let analysis = analyse(&path, waveform_dir, range);
+                    if results.send((id, analysis)).is_err() {
                         break;
                     }
                 }
@@ -79,12 +93,12 @@ struct Analysis {
 }
 
 /// A file that cannot be decoded simply has nothing to report.
-fn analyse(path: &Path) -> Analysis {
-    let Ok(track) = Track::decode(path, ANALYSIS_RATE) else {
+fn analyse(path: &Path, waveform_dir: &Path, range: TempoRange) -> Analysis {
+    let Ok(track) = Track::decode_cached(path, ANALYSIS_RATE, Some(waveform_dir)) else {
         return Analysis::default();
     };
     let samples = track.mono();
-    let tempo = detect_tempo(&samples, ANALYSIS_RATE, TempoRange::default());
+    let tempo = detect_tempo(&samples, ANALYSIS_RATE, range);
     // Cue points sit on the bar lines of a tempo worth trusting.
     let structure = detect_structure(
         &samples,
@@ -95,6 +109,7 @@ fn analyse(path: &Path) -> Analysis {
         tempo: tempo.map(|tempo| TempoResult {
             bpm: tempo.bpm,
             first_beat_seconds: tempo.first_beat_seconds,
+            downbeat: tempo.downbeat,
             confidence: tempo.confidence as f64,
         }),
         key: detect_key(&samples, ANALYSIS_RATE).map(|key| KeyResult {

@@ -200,8 +200,18 @@ impl Track {
 
     /// Decodes a whole file, resampled to `sample_rate`. Blocking.
     pub fn decode(path: &Path, sample_rate: u32) -> Result<Arc<Self>, DecodeError> {
+        Self::decode_cached(path, sample_rate, None)
+    }
+
+    /// Decodes a whole file, as [`Track::decode`] does, and saves its
+    /// waveform in `cache_dir` if it is not there yet.
+    pub fn decode_cached(
+        path: &Path,
+        sample_rate: u32,
+        cache_dir: Option<&Path>,
+    ) -> Result<Arc<Self>, DecodeError> {
         let mut track = None;
-        Self::load(path, sample_rate, None, |opened| track = Some(opened))?;
+        Self::load(path, sample_rate, cache_dir, |opened| track = Some(opened))?;
         Ok(track.expect("load succeeded without opening a track"))
     }
 

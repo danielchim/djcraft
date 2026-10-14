@@ -10,7 +10,7 @@ use gpui_kit::*;
 
 use djcraft_library::lookup::Provider;
 
-use crate::settings::{Settings, StartTab, ThemeChoice, data_dir};
+use crate::settings::{self, Settings, StartTab, ThemeChoice, data_dir};
 
 actions!(settings, [CloseSettings]);
 
@@ -325,6 +325,78 @@ impl SettingsView {
                     |settings, provider| settings.info_provider = provider,
                     cx,
                 );
+                let lowest = self.dropdown(
+                    "tempo-min",
+                    self.settings.tempo_min_bpm,
+                    &settings::MIN_BPM_CHOICES,
+                    settings::bpm_label,
+                    |settings, bpm| settings.tempo_min_bpm = bpm,
+                    cx,
+                );
+                let highest = self.dropdown(
+                    "tempo-max",
+                    self.settings.tempo_max_bpm,
+                    &settings::MAX_BPM_CHOICES,
+                    settings::bpm_label,
+                    |settings, bpm| settings.tempo_max_bpm = bpm,
+                    cx,
+                );
+                let decimals = self.dropdown(
+                    "bpm-decimals",
+                    self.settings.bpm_decimals,
+                    &settings::BPM_DECIMAL_CHOICES,
+                    settings::bpm_decimals_label,
+                    |settings, decimals| settings.bpm_decimals = decimals,
+                    cx,
+                );
+                let keep_tempo = Switch::new("keep-tagged-tempo")
+                    .checked(self.settings.keep_tagged_tempo)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        let checked = *checked;
+                        this.change(|settings| settings.keep_tagged_tempo = checked, cx);
+                    }));
+                let keep_key = Switch::new("keep-tagged-key")
+                    .checked(self.settings.keep_tagged_key)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        let checked = *checked;
+                        this.change(|settings| settings.keep_tagged_key = checked, cx);
+                    }));
+                let analysis = self.section(
+                    "Analysis",
+                    vec![
+                        self.row(
+                            "Lowest tempo",
+                            "Tracks are given a tempo between the lowest and the highest. A beat at 70 BPM is also a beat at 140, and this range decides which one a track gets. If you change it, the whole library is analysed again.",
+                            lowest,
+                            cx,
+                        ),
+                        self.row(
+                            "Highest tempo",
+                            "The top of the tempo range. If you change it, the whole library is analysed again.",
+                            highest,
+                            cx,
+                        ),
+                        self.row(
+                            "Show tempos with",
+                            "Decimal places for tempos in lists and the info panel. The measured tempo and the beat grid stay exact.",
+                            decimals,
+                            cx,
+                        ),
+                        self.row(
+                            "Keep tempo from tags",
+                            "Show the tempo in a file's tags instead of the measured one, if the file has one. The beat grid still comes from the measurement.",
+                            keep_tempo,
+                            cx,
+                        ),
+                        self.row(
+                            "Keep key from tags",
+                            "Show the key in a file's tags instead of the detected one, if the file has one. A key that you type in is always kept.",
+                            keep_key,
+                            cx,
+                        ),
+                    ],
+                    cx,
+                );
                 let music_info = self.section(
                     "Music info",
                     vec![self.row(
@@ -358,7 +430,7 @@ impl SettingsView {
                         ),
                     ],
                     cx,
-                ), music_info]
+                ), analysis, music_info]
             }
             Page::Assistant => vec![self.section(
                 "Assistant",

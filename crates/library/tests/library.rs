@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use djcraft_library::{
-    Camelot, ClipPlacement, CuePoint, FolderWatcher, ImportSummary, KeyResult, Library,
+    Camelot, ClipPlacement, CuePoint, FolderWatcher, ImportSummary, KeepTagged, KeyResult, Library,
     ScanSummary, SourceKind, TempoResult, TrackEdit, TrackQuery, read_artwork, read_playlists,
 };
 use lofty::config::WriteOptions;
@@ -397,6 +397,9 @@ fn an_existing_library_gains_playlists_on_upgrade() {
     let raw = rusqlite::Connection::open(&db).unwrap();
     raw.execute_batch(
         "DROP TABLE playlist_tracks; DROP TABLE playlists;
+         DROP TABLE options;
+         ALTER TABLE tracks DROP COLUMN tempo_downbeat;
+         ALTER TABLE tracks DROP COLUMN key_manual;
          ALTER TABLE tracks DROP COLUMN key_detected;
          ALTER TABLE tracks DROP COLUMN key_confidence;
          ALTER TABLE tracks DROP COLUMN cues_manual;
@@ -716,6 +719,7 @@ fn measured_tempo_is_stored_and_shown() {
     let sure = TempoResult {
         bpm: 128.02,
         first_beat_seconds: 0.25,
+        downbeat: 0,
         confidence: 0.4,
     };
     library.store_tempo(tagged, 1, Some(sure)).unwrap();
@@ -726,6 +730,7 @@ fn measured_tempo_is_stored_and_shown() {
     let unsure = TempoResult {
         bpm: 87.0,
         first_beat_seconds: 0.0,
+        downbeat: 0,
         confidence: 0.03,
     };
     library.store_tempo(bare, 1, Some(unsure)).unwrap();
@@ -867,6 +872,90 @@ fn a_detected_key_stands_in_for_a_missing_tag() {
 }
 
 #[test]
+fn tagged_tempo_and_key_can_be_kept_over_measured_ones() {
+    let dir = TempDir::new("keep-tagged");
+    write_tagged(&dir.0.join("a.wav"), "Tagged", "A", "", "126", "Am");
+    write_wav(&dir.0.join("b.wav"));
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let all = library.tracks(&TrackQuery::default()).unwrap();
+    let id_of = |title: &str| all.iter().find(|t| t.title == title).unwrap().id;
+    let (tagged, bare) = (id_of("Tagged"), id_of("b"));
+    let listed = |library: &Library, id: i64| {
+        let query = TrackQuery {
+            id: Some(id),
+            ..Default::default()
+        };
+        let track = library.tracks(&query).unwrap().remove(0);
+        (track.bpm, track.key)
+    };
+    let grid = TempoResult {
+        bpm: 125.98,
+        first_beat_seconds: 0.2,
+        downbeat: 3,
+        confidence: 0.6,
+    };
+    let key = |code: &str| {
+        Some(KeyResult {
+            key: Camelot::parse(code).unwrap(),
+            confidence: 0.9,
+        })
+    };
+    for id in [tagged, bare] {
+        library.store_tempo(id, 1, Some(grid)).unwrap();
+        library.store_key(id, key("3B")).unwrap();
+    }
+
+    // At first, measured tempos and tagged keys are listed.
+    assert_eq!(library.keep_tagged().unwrap(), KeepTagged::default());
+    assert_eq!(listed(&library, tagged), (Some(125.98), Some("Am".into())));
+    assert_eq!(library.beat_grid(tagged).unwrap(), Some(grid));
+
+    // The other way round, for every connection to the library.
+    let both_ways = KeepTagged {
+        tempo: true,
+        key: false,
+    };
+    library.set_keep_tagged(both_ways).unwrap();
+    assert_eq!(library.keep_tagged().unwrap(), both_ways);
+    assert_eq!(listed(&library, tagged), (Some(126.0), Some("3B".into())));
+    // A track with nothing in its tags still shows what was measured, and
+    // the grid is the measured one whatever is listed.
+    assert_eq!(listed(&library, bare), (Some(125.98), Some("3B".into())));
+    assert_eq!(library.beat_grid(tagged).unwrap(), Some(grid));
+    assert_eq!(library.key_counts().unwrap().len(), 1);
+    assert!((grid.first_bar_seconds() - (0.2 + 3.0 * 60.0 / 125.98)).abs() < 1e-9);
+    let path = all.iter().find(|t| t.id == bare).unwrap().path.clone();
+    assert_eq!(library.track_at(&path).unwrap(), Some(bare));
+    // The same file by a path that is not the real one: on macOS the temp
+    // folder is reached through a link.
+    assert_eq!(library.track_at(&dir.0.join("b.wav")).unwrap(), Some(bare));
+    assert_eq!(
+        library.track_at(&dir.0.join(".").join("b.wav")).unwrap(),
+        Some(bare)
+    );
+    assert_eq!(library.track_at(&dir.0.join("missing.wav")).unwrap(), None);
+
+    // A key typed in stands, even over a detected one.
+    let edit = TrackEdit {
+        title: "Tagged".into(),
+        artist: "A".into(),
+        album: String::new(),
+        genre: String::new(),
+        bpm: Some(126.0),
+        key: Some("5A".into()),
+    };
+    library.edit_track(tagged, &edit).unwrap();
+    assert_eq!(listed(&library, tagged), (Some(126.0), Some("5A".into())));
+
+    // Everything can be queued for analysis again.
+    assert!(library.pending_tempo_analysis(1).unwrap().is_empty());
+    assert_eq!(library.reset_analysis().unwrap(), 2);
+    assert_eq!(library.pending_tempo_analysis(1).unwrap().len(), 2);
+}
+
+#[test]
 fn flows_place_and_trim_clips_on_lanes() {
     let dir = TempDir::new("flow");
     write_tagged(&dir.0.join("a.wav"), "First", "A", "", "120", "8A");
@@ -880,6 +969,7 @@ fn flows_place_and_trim_clips_on_lanes() {
     let grid = TempoResult {
         bpm: 120.0,
         first_beat_seconds: 0.1,
+        downbeat: 0,
         confidence: 0.5,
     };
     library.store_tempo(first, 1, Some(grid)).unwrap();

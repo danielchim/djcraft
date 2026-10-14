@@ -6,10 +6,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
+use djcraft_analysis::TempoRange;
 use djcraft_library::lookup::{self, Provider, TrackMatch};
 use djcraft_library::{
-    Camelot, FolderWatcher, ImportSummary, Library, Playlist, Source, SourceKind, Track, TrackEdit,
-    TrackQuery, read_artwork, read_playlists,
+    Camelot, FolderWatcher, ImportSummary, Library, Playlist, Source, SourceKind, TempoResult,
+    Track, TrackEdit, TrackQuery, read_artwork, read_playlists,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -127,6 +128,13 @@ impl EditField {
 }
 
 /// A tempo without needless decimals: 128, 127.5.
+/// How many decimals tempos are shown with, from the settings.
+pub fn bpm_decimals(cx: &App) -> u8 {
+    cx.try_global::<crate::settings::Settings>()
+        .map_or(1, |settings| settings.bpm_decimals)
+}
+
+/// A tempo for an edit box: as precise as it is, without trailing zeros.
 fn format_bpm(bpm: f64) -> String {
     let text = format!("{bpm:.2}");
     text.trim_end_matches('0').trim_end_matches('.').to_string()
@@ -168,7 +176,8 @@ pub enum LibraryEvent {
     },
     /// A track was picked out in one of the compact browsers.
     Selected { id: i64 },
-    /// A scan finished, so the database may hold different tracks.
+    /// A scan or analysis moved on, so the database may hold different
+    /// tracks, or new results for them.
     Changed,
 }
 
@@ -504,9 +513,10 @@ impl TableDelegate for TrackTable {
         row_ix: usize,
         col_ix: usize,
         _: &mut Window,
-        _: &mut Context<TableState<Self>>,
+        cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let track = &self.tracks[row_ix];
+        let decimals = bpm_decimals(cx);
         let text: SharedString = match COLUMNS[col_ix].0 {
             Field::Title => track.title.clone().into(),
             Field::Artist => track.artist.clone().into(),
@@ -523,7 +533,7 @@ impl TableDelegate for TrackTable {
                 .into(),
             Field::Bpm => track
                 .bpm
-                .map(|bpm| format!("{bpm:.1}"))
+                .map(|bpm| crate::settings::format_bpm(bpm, decimals))
                 .unwrap_or_default()
                 .into(),
             // Camelot notation when the tag can be understood, else as tagged.
@@ -588,6 +598,11 @@ pub struct LibraryView {
     scan_counters: Arc<ScanCounters>,
     /// Watches the folders for changes; `None` when that is switched off.
     watcher: Option<FolderWatcher>,
+    /// The tempo range tracks are analysed with.
+    tempo_range: TempoRange,
+    /// Set when the library must be analysed again once the pass under way
+    /// has stopped.
+    reanalyse: bool,
     /// The key picked on the Camelot wheel.
     wheel_key: Option<Camelot>,
     key_counts: HashMap<Camelot, usize>,
@@ -692,12 +707,23 @@ impl LibraryView {
             running_scans: 0,
             scan_counters: Arc::default(),
             watcher: None,
+            tempo_range: TempoRange::default(),
+            reanalyse: false,
             flow: (!compact).then(|| cx.new(|cx| crate::flow_view::FlowView::new(window, cx))),
             wheel_key: None,
             key_counts: HashMap::new(),
             analysing: false,
             analysis: Arc::default(),
         };
+        if !compact && let Some(settings) = cx.try_global::<crate::settings::Settings>().cloned() {
+            view.tempo_range = settings.tempo_range();
+            // The database holds this too, for every connection to see.
+            if let Some(library) = &view.library
+                && let Err(error) = library.set_keep_tagged(settings.keep_tagged())
+            {
+                view.error = Some(error.to_string().into());
+            }
+        }
         view.show_section(Section::Library, cx);
         // Pick up anything that changed on disk since the last run.
         // The Library tab does this; the browser shares its database.
@@ -714,6 +740,48 @@ impl LibraryView {
             view.poll_watcher(cx);
         }
         view
+    }
+
+    /// Follows a change to the settings that affect the library: how
+    /// tracks are listed, and the tempo range they are analysed with.
+    pub fn apply_settings(&mut self, settings: &crate::settings::Settings, cx: &mut Context<Self>) {
+        self.set_watching(settings.watch_folders);
+        if let Some(library) = &self.library
+            && library.keep_tagged().ok() != Some(settings.keep_tagged())
+            && let Err(error) = library.set_keep_tagged(settings.keep_tagged())
+        {
+            self.error = Some(error.to_string().into());
+        }
+        let range = settings.tempo_range();
+        if range != self.tempo_range {
+            self.tempo_range = range;
+            self.reanalyse(cx);
+        }
+        self.reload(cx);
+        cx.emit(LibraryEvent::Changed);
+    }
+
+    /// Analyses every track again. A pass under way is stopped first, since
+    /// it was started with the old settings.
+    fn reanalyse(&mut self, cx: &mut Context<Self>) {
+        if self.analysing {
+            self.reanalyse = true;
+            self.analysis.cancel.store(true, AtomicOrdering::Relaxed);
+            return;
+        }
+        if let Some(library) = &self.library
+            && let Err(error) = library.reset_analysis()
+        {
+            self.error = Some(error.to_string().into());
+        }
+        self.analyse(cx);
+    }
+
+    /// The beat grid of the library track at `path`, if it has one.
+    pub fn beat_grid_at(&self, path: &Path) -> Option<TempoResult> {
+        let library = self.library.as_ref()?;
+        let id = library.track_at(path).ok()??;
+        library.beat_grid(id).ok()?
     }
 
     /// Starts or stops watching the library's folders for changes.
@@ -773,12 +841,22 @@ impl LibraryView {
         self.analysing = true;
         let db_path = self.db_path.clone();
         let progress = self.analysis.clone();
-        let work = cx
-            .background_spawn(async move { crate::analysis::analyse_pending(&db_path, &progress) });
+        let range = self.tempo_range;
+        let work = cx.background_spawn(async move {
+            let waveforms = crate::settings::waveform_dir();
+            crate::analysis::analyse_pending(&db_path, &waveforms, range, &progress)
+        });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             this.update(cx, |this, cx| {
                 this.analysing = false;
+                cx.emit(LibraryEvent::Changed);
+                if std::mem::take(&mut this.reanalyse) {
+                    this.analysis.cancel.store(false, AtomicOrdering::Relaxed);
+                    this.reanalyse(cx);
+                    this.reload(cx);
+                    return;
+                }
                 let analysed_some = this.analysis.total.load(AtomicOrdering::Relaxed) > 0;
                 match result {
                     // Tracks may have been added while this pass was busy;
@@ -797,6 +875,7 @@ impl LibraryView {
                 cx.background_executor().timer(ANALYSIS_REFRESH).await;
                 let analysing = this.update(cx, |this, cx| {
                     this.reload(cx);
+                    cx.emit(LibraryEvent::Changed);
                     this.analysing
                 });
                 if !analysing.unwrap_or(false) {
@@ -1100,7 +1179,11 @@ impl LibraryView {
         let (border, muted, tile) = (theme.border, theme.muted_foreground, theme.secondary);
         let seconds = track.duration_seconds.round() as u64;
         let editing = self.editing;
-        let bpm = track.bpm.map(format_bpm).unwrap_or_default();
+        let decimals = bpm_decimals(cx);
+        let bpm = track
+            .bpm
+            .map(|bpm| crate::settings::format_bpm(bpm, decimals))
+            .unwrap_or_default();
         let labelled = |field: EditField| {
             let label = div().text_xs().text_color(muted).child(field.label());
             let column = div().flex().flex_col().gap_1().child(label);

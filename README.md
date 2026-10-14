@@ -20,17 +20,22 @@ is the full plan, with the status of every item.
 - **Track info:** view a track's details and cover art, edit them (changes are
   written to the file's tags), and look them up on MusicBrainz or the iTunes
   Store.
-- **Decks:** two decks with scrolling waveforms, tempo control and key lock.
-  Tracks become playable within a second or two while the rest decodes, and
-  waveforms are cached between runs.
+- **Decks:** two decks with tempo control and key lock. Each deck shows a
+  scrolling waveform with the beat grid and bar lines, and a whole-track
+  waveform that you click to jump. Tracks become playable within a second
+  or two while the rest decodes.
 - **Track browser:** the library and playlists sit under the decks; double-click
   a track to load it.
-- **Tempo analysis:** tracks are analysed in the background for BPM and beat
-  positions. It assumes a steady tempo, as most dance music has.
-- **Settings:** theme, start-up tab, start-up scanning and lookup provider.
+- **Analysis:** tracks are analysed in the background for BPM, beats, bars,
+  key, energy and cue points, and their waveforms are made ahead of time.
+  It assumes a steady tempo, four beats to the bar and a single key, as most
+  dance music has. You choose the tempo range, how many decimals tempos
+  show, and whether the tempo and key in a file's tags are kept over the
+  measured ones.
+- **Settings:** theme, start-up tab, start-up scanning, folder watching,
+  analysis and lookup provider.
 
-The Radio tab, live broadcasting, remote sessions, effects, the mixer, key and
-energy analysis and plugins are planned but not built.
+The Radio tab, live broadcasting, remote sessions, effects, the mixer and plugins are planned but not built.
 
 ## Building
 
@@ -61,7 +66,7 @@ audio layer need the development packages listed in
 | What | macOS location |
 |---|---|
 | Library database and settings | `~/Library/Application Support/djcraft` |
-| Waveform cache | `~/Library/Caches/djcraft` |
+| Waveforms | `~/Library/Application Support/djcraft/waveforms` |
 
 Set `DJCRAFT_DATA_DIR` to use a different library, for example while testing.
 Your music files are only changed when you press Save in the track info panel.

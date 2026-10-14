@@ -48,16 +48,15 @@ Status key: `[ ]` to do, `[~]` in progress, `[x]` done.
 
 ### Analysis
 
-- [~] BPM and beat grid detection (constant-tempo tracks, analysed in the
-      background; the grid is stored but not drawn yet, and bars are not
-      detected)
+- [~] BPM and beat grid detection (constant tempo and four beats to the bar
+      only; tested on synthetic audio only, so accuracy on real tracks is
+      not measured yet)
 - [~] Key detection (one key per track, major or minor; tested on
       synthetic music only, so accuracy on real tracks is not measured yet)
-- [ ] Waveform generation (overview and detail)
-- [~] Analysis cache stored alongside the library database (tempo results
-      are in the library database; waveforms are in the user cache folder)
-- [ ] Tempo range limits (minimum and maximum BPM) and precision setting
-- [ ] Option to keep an existing tempo or key instead of overwriting it
+- [x] Waveform generation (overview and detail)
+- [x] Analysis cache stored alongside the library database
+- [x] Tempo range limits (minimum and maximum BPM) and precision setting
+- [x] Option to keep an existing tempo or key instead of overwriting it
 
 ### Harmonic mixing and energy
 
@@ -107,8 +106,7 @@ Feature set modelled on Mixed In Key 10.
 - [~] Timeline editor with four lanes, matching the decks: place tracks,
       move them between lanes, and trim either end (built; planning only, no
       audio)
-- [~] Trim snaps to the track's bars; a moved clip snaps to other clips' edges
-      (bars are counted from the first beat, since downbeats are not detected)
+- [x] Trim snaps to the track's bars; a moved clip snaps to other clips' edges
 - [~] Transition notes where one track comes in over another: tempo change
       and whether the keys mix
 - [~] Add tracks by double-click (appended with a typical overlap) or by
@@ -164,10 +162,11 @@ Feature set modelled on Mixed In Key 10.
 
 ### Decks
 
-- [ ] Two decks with scrolling and overview waveforms
-- [ ] Play/pause, cue, jump to start
-- [ ] Tempo fader with selectable ranges
-- [ ] Master tempo (key lock)
+- [x] Two decks with scrolling and overview waveforms
+- [~] Play/pause, cue, jump to start (play and pause only)
+- [~] Tempo fader with selectable ranges (slower and faster buttons in 1%
+      steps over one fixed range; no fader)
+- [x] Master tempo (key lock)
 - [ ] Beat sync and quantize
 - [ ] Hot cues (8 per deck)
 - [ ] Memory cues
