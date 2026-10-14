@@ -1121,6 +1121,53 @@ fn batch_tag_changes_are_reviewed_applied_and_undone() {
 }
 
 #[test]
+fn tags_are_written_and_read_back_in_every_format() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let dir = TempDir::new("formats");
+    let formats = ["mp3", "flac", "ogg", "opus", "m4a", "aiff"];
+    for format in formats {
+        std::fs::copy(
+            fixtures.join(format!("silence.{format}")),
+            dir.0.join(format!("{format}.{format}")),
+        )
+        .unwrap();
+    }
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let tracks = library.tracks(&TrackQuery::default()).unwrap();
+    assert_eq!(tracks.len(), formats.len());
+
+    for track in &tracks {
+        let edit = TrackEdit {
+            title: format!("Title {}", track.title),
+            artist: "Artist Ü".into(),
+            album: "Album".into(),
+            genre: "Tech House".into(),
+            bpm: Some(127.5),
+            key: Some("8A".into()),
+            comment: Some("8A - Energy 7".into()),
+            grouping: Some("Peak time".into()),
+        };
+        library
+            .edit_track(track.id, &edit)
+            .unwrap_or_else(|e| panic!("{}: {e}", track.title));
+        let (_, read) = library.file_tags(track.id).unwrap();
+        assert_eq!(read, edit, "{}", track.title);
+    }
+
+    // A library built afresh from the files agrees.
+    let mut fresh = Library::open_in_memory().unwrap();
+    let source = fresh.add_folder(&dir.0).unwrap();
+    fresh.scan(source.id, |_| {}).unwrap();
+    for track in fresh.tracks(&TrackQuery::default()).unwrap() {
+        assert!(track.title.starts_with("Title "), "{}", track.title);
+        assert_eq!(track.artist, "Artist Ü");
+        assert_eq!(track.camelot, Camelot::parse("8A"), "{}", track.title);
+    }
+}
+
+#[test]
 fn flows_place_and_trim_clips_on_lanes() {
     let dir = TempDir::new("flow");
     write_tagged(&dir.0.join("a.wav"), "First", "A", "", "120", "8A");
