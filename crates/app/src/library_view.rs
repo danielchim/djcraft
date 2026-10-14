@@ -37,6 +37,8 @@ const ANALYSIS_REFRESH: Duration = Duration::from_secs(2);
 /// What a menu entry does to the library view.
 type MenuAction = Box<dyn Fn(&mut LibraryView, &mut Window, &mut Context<LibraryView>)>;
 
+/// How many suggestions for the next track are listed.
+const SUGGESTIONS: usize = 50;
 /// How often watched folders are asked whether they changed.
 const WATCH_POLL: Duration = Duration::from_secs(1);
 /// How long a folder must be left alone before it is scanned, so that a
@@ -340,6 +342,9 @@ struct TrackTable {
     playlist: Option<i64>,
     /// Whether it is a smart playlist, whose order cannot be changed.
     smart: bool,
+    /// Rows come in an order of their own (best suggestions first), kept
+    /// unless the user sorts.
+    keep_order: bool,
     /// The columns shown, as places in [`COLUMNS`].
     visible: Vec<usize>,
 }
@@ -353,6 +358,7 @@ impl TrackTable {
             playlists: Vec::new(),
             playlist: None,
             smart: false,
+            keep_order: false,
             visible: (0..COLUMNS.len()).collect(),
         }
     }
@@ -379,7 +385,7 @@ impl TrackTable {
 
     fn apply_sort(&mut self) {
         // An unsorted playlist stays in playlist order.
-        if self.playlist.is_some() && !self.sorted_by_user() {
+        if (self.playlist.is_some() || self.keep_order) && !self.sorted_by_user() {
             return;
         }
         let text = |a: &str, b: &str| a.to_lowercase().cmp(&b.to_lowercase());
@@ -665,6 +671,10 @@ pub struct LibraryView {
     folders: Vec<PlaylistFolder>,
     /// Playlist folders shown closed.
     collapsed: HashSet<i64>,
+    /// In the browser under the decks: the track on the decks that
+    /// suggestions are for, and whether they are being shown.
+    reference: Option<(i64, SharedString)>,
+    suggesting: bool,
     /// The duplicates dialog, while it is open, to refresh after a merge.
     duplicates: Option<Entity<DuplicatesView>>,
     /// The key picked on the Camelot wheel.
@@ -775,6 +785,8 @@ impl LibraryView {
             groups: Vec::new(),
             folders: Vec::new(),
             collapsed: HashSet::new(),
+            reference: None,
+            suggesting: false,
             duplicates: None,
             flow: (!compact).then(|| cx.new(|cx| crate::flow_view::FlowView::new(window, cx))),
             wheel_key: None,
@@ -976,8 +988,19 @@ impl LibraryView {
                 .clone()
                 .filter(|_| !in_playlists && !self.compact),
         };
+        let suggest_for = self
+            .reference
+            .as_ref()
+            .map(|(id, _)| *id)
+            .filter(|_| self.compact && self.suggesting);
         let loaded = (|| {
-            let tracks = if in_playlists && query.playlist.is_none() {
+            let tracks = if let Some(reference) = suggest_for {
+                library
+                    .suggest_next(reference, SUGGESTIONS)?
+                    .into_iter()
+                    .map(|suggestion| suggestion.track)
+                    .collect()
+            } else if in_playlists && query.playlist.is_none() {
                 Vec::new()
             } else {
                 library.tracks(&query)?
@@ -1000,6 +1023,8 @@ impl LibraryView {
                 self.table.update(cx, |table, cx| {
                     let table = table.delegate_mut();
                     table.smart = smart;
+                    // Suggestions come best first; a sort would hide that.
+                    table.keep_order = suggest_for.is_some();
                     table.set_tracks(tracks, playlists, query.playlist);
                     cx.notify();
                 });
@@ -1726,6 +1751,34 @@ impl LibraryView {
         self.selected = None;
         self.group = Some(group);
         self.reload(cx);
+    }
+
+    /// Sets the track on the decks that suggestions are for, for the
+    /// browser under the decks.
+    pub fn set_reference(
+        &mut self,
+        reference: Option<(i64, SharedString)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.reference != reference {
+            self.reference = reference;
+            if self.suggesting {
+                self.reload(cx);
+            }
+            cx.notify();
+        }
+    }
+
+    /// The library track at a path, with its title, if there is one.
+    pub fn track_at(&self, path: &Path) -> Option<(i64, SharedString)> {
+        let library = self.library.as_ref()?;
+        let id = library.track_at(path).ok()??;
+        let query = TrackQuery {
+            id: Some(id),
+            ..Default::default()
+        };
+        let track = library.tracks(&query).ok()?.pop()?;
+        Some((id, track.title.into()))
     }
 
     /// Opens a small dialog that asks for a name, then calls `done` with it.
@@ -3161,30 +3214,45 @@ impl LibraryView {
                             .text_color(cx.theme().muted_foreground)
                             .child(status),
                     )
-                    .when(
-                        self.group == Some(Group::Missing) && !self.compact,
-                        |this| {
+                    .when(self.group == Some(Group::Missing) && !self.compact, |this| {
+                        this.child(
+                            Button::new("find-moved")
+                                .outline()
+                                .small()
+                                .icon(IconName::FileSearch)
+                                .label("Find in a folder…")
+                                .tooltip("Look for the missing files in a folder and relink them")
+                                .on_click(cx.listener(|this, _, window, cx| this.find_moved(window, cx))),
+                        )
+                        .child(
+                            Button::new("remove-missing-tracks")
+                                .outline()
+                                .small()
+                                .icon(IconName::Trash)
+                                .label("Remove all")
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.remove_missing(window, cx)),
+                                ),
+                        )
+                    })
+                    .when_some(
+                        self.reference.clone().filter(|_| self.compact),
+                        |this, (_, title)| {
                             this.child(
-                                Button::new("find-moved")
+                                Button::new("suggest-next")
                                     .outline()
                                     .small()
-                                    .icon(IconName::FileSearch)
-                                    .label("Find in a folder…")
-                                    .tooltip(
-                                        "Look for the missing files in a folder and relink them",
-                                    )
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.find_moved(window, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("remove-missing-tracks")
-                                    .outline()
-                                    .small()
-                                    .icon(IconName::Trash)
-                                    .label("Remove all")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.remove_missing(window, cx)
+                                    .icon(IconName::Sparkles)
+                                    .label(if self.suggesting {
+                                        format!("Mixes with {title}")
+                                    } else {
+                                        "Suggest next".to_string()
+                                    })
+                                    .tooltip("Tracks whose key and tempo mix with the track on the decks")
+                                    .selected(self.suggesting)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.suggesting = !this.suggesting;
+                                        this.reload(cx);
                                     })),
                             )
                         },

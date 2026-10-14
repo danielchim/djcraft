@@ -53,6 +53,8 @@ pub struct Shell {
     grids: Vec<Option<TempoResult>>,
     /// Where each deck's whole-track waveform is on screen, for seeking.
     overview_areas: Vec<Rc<Cell<Bounds<Pixels>>>>,
+    /// The deck a track was loaded onto last.
+    last_loaded: Option<usize>,
 }
 
 impl Shell {
@@ -122,6 +124,7 @@ impl Shell {
             deck_paths: vec![None; 2],
             grids: vec![None; 2],
             overview_areas: (0..2).map(|_| Rc::default()).collect(),
+            last_loaded: None,
         };
         for (deck, path) in tracks.into_iter().enumerate() {
             shell.send(deck, DeckAction::Load { path });
@@ -130,7 +133,9 @@ impl Shell {
         shell
     }
 
-    /// Looks up the beat grid of each deck's track in the library.
+    /// Looks up the beat grid of each deck's track in the library, and tells
+    /// the browser which track to suggest what comes next for: the one
+    /// loaded last.
     fn refresh_grids(&mut self, cx: &mut Context<Self>) {
         let library = self.library.read(cx);
         self.grids = self
@@ -138,6 +143,12 @@ impl Shell {
             .iter()
             .map(|path| path.as_deref().and_then(|path| library.beat_grid_at(path)))
             .collect();
+        let reference = self
+            .last_loaded
+            .and_then(|deck| self.deck_paths.get(deck)?.as_deref())
+            .and_then(|path| library.track_at(path));
+        self.browser
+            .update(cx, |view, cx| view.set_reference(reference, cx));
     }
 
     pub fn show(&mut self, tab: Tab, cx: &mut Context<Self>) {
@@ -222,6 +233,7 @@ impl Shell {
             && let Some(slot) = self.deck_paths.get_mut(deck)
         {
             *slot = Some(PathBuf::from(path));
+            self.last_loaded = Some(deck);
         }
         if let Err(reason) = engine.apply(Role::Host, action) {
             eprintln!("action rejected: {reason:?}");

@@ -1,5 +1,6 @@
 //! Organising the library: playlist folders and order, smart playlists,
-//! automatic groups, duplicates, and tracks whose files have gone missing.
+//! automatic groups, suggestions for the next track, duplicates, and tracks
+//! whose files have gone missing.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -249,12 +250,47 @@ pub struct PlaylistFolder {
     pub parent: Option<i64>,
 }
 
+/// How well a track's key mixes with another's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum KeyFit {
+    Same,
+    /// One step round the Camelot wheel.
+    Adjacent,
+    /// The relative major or minor.
+    Relative,
+    /// One of the two keys is not known.
+    Unknown,
+}
+
+impl KeyFit {
+    pub fn label(self) -> &'static str {
+        match self {
+            KeyFit::Same => "same key",
+            KeyFit::Adjacent => "next key",
+            KeyFit::Relative => "relative key",
+            KeyFit::Unknown => "key unknown",
+        }
+    }
+}
+
+/// A track that could follow another in a mix.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Suggestion {
+    pub track: Track,
+    pub key_fit: KeyFit,
+    /// How far the tempo would move to match, in percent: +2.0 means the
+    /// suggested track must be sped up by 2%.
+    pub tempo_change: f64,
+}
+
 /// Tracks that look like copies of one another, the one best kept first.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DuplicateGroup {
     pub tracks: Vec<Track>,
 }
 
+/// Tempos further apart than this, in percent, are not suggested.
+const MAX_TEMPO_CHANGE: f64 = 6.0;
 /// Copies of a track may differ in length by this much, from encoding.
 const DUPLICATE_SECONDS: f64 = 2.0;
 
@@ -458,6 +494,64 @@ impl Library {
             });
         }
         Ok(groups)
+    }
+
+    /// Tracks that would mix well after `reference`: in a key that mixes with
+    /// it and within a few percent of its tempo (or half or double it),
+    /// best first. A reference with no tempo has no suggestions.
+    pub fn suggest_next(&self, reference: i64, limit: usize) -> Result<Vec<Suggestion>> {
+        let all = self.tracks(&TrackQuery::default())?;
+        let Some(base) = all.iter().find(|track| track.id == reference) else {
+            return Ok(Vec::new());
+        };
+        let Some(base_bpm) = base.bpm.filter(|bpm| *bpm > 0.0) else {
+            return Ok(Vec::new());
+        };
+        let mut found: Vec<(f64, Suggestion)> = all
+            .iter()
+            .filter(|track| track.id != reference && !track.missing)
+            .filter_map(|track| {
+                let bpm = track.bpm.filter(|bpm| *bpm > 0.0)?;
+                // A track at half or double the tempo mixes too.
+                let change = [bpm, bpm * 2.0, bpm / 2.0]
+                    .into_iter()
+                    .map(|bpm| (base_bpm / bpm - 1.0) * 100.0)
+                    .min_by(|a, b| a.abs().total_cmp(&b.abs()))?;
+                if change.abs() > MAX_TEMPO_CHANGE {
+                    return None;
+                }
+                let key_fit = match (base.camelot, track.camelot) {
+                    (Some(a), Some(b)) if a == b => KeyFit::Same,
+                    (Some(a), Some(b)) if a.major == b.major && a.compatible().contains(&b) => {
+                        KeyFit::Adjacent
+                    }
+                    (Some(a), Some(b)) if a.number == b.number => KeyFit::Relative,
+                    (Some(_), Some(_)) => return None,
+                    _ => KeyFit::Unknown,
+                };
+                let key_cost = match key_fit {
+                    KeyFit::Same => 0.0,
+                    KeyFit::Adjacent => 1.0,
+                    KeyFit::Relative => 1.5,
+                    KeyFit::Unknown => 3.0,
+                };
+                let energy_cost = match (base.energy, track.energy) {
+                    (Some(a), Some(b)) => (a as f64 - b as f64).abs() * 0.3,
+                    _ => 0.5,
+                };
+                let cost = key_cost + change.abs() / 2.0 + energy_cost;
+                Some((
+                    cost,
+                    Suggestion {
+                        track: track.clone(),
+                        key_fit,
+                        tempo_change: change,
+                    },
+                ))
+            })
+            .collect();
+        found.sort_by(|a, b| a.0.total_cmp(&b.0));
+        Ok(found.into_iter().take(limit).map(|(_, s)| s).collect())
     }
 
     /// Groups of tracks that look like copies: the same artist and title

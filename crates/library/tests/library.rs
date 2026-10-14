@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 
 use djcraft_library::{
     AlignOptions, Camelot, Cleanup, ClipPlacement, CuePoint, EnergyBand, FolderWatcher, Group,
-    ImportSummary, KeepTagged, KeyResult, Library, Placement, Rule, ScanSummary, SmartRules,
-    SourceKind, TagField, TempoResult, TextField, TextOp, TrackEdit, TrackQuery, read_artwork,
-    read_playlists,
+    ImportSummary, KeepTagged, KeyFit, KeyResult, Library, Placement, Rule, ScanSummary,
+    SmartRules, SourceKind, TagField, TempoResult, TextField, TextOp, TrackEdit, TrackQuery,
+    read_artwork, read_playlists,
 };
 use lofty::config::WriteOptions;
 use lofty::tag::{Accessor, ItemKey, Tag, TagExt, TagType};
@@ -1400,6 +1400,25 @@ fn tracks_fall_into_automatic_groups() {
         ..Default::default()
     };
     assert_eq!(library.tracks(&tech).unwrap().len(), 2);
+}
+
+#[test]
+fn suggestions_mix_by_key_and_tempo() {
+    let dir = TempDir::new("suggest");
+    write_tagged(&dir.0.join("a.wav"), "One", "A", "Tech House", "124", "8A");
+    write_tagged(&dir.0.join("b.wav"), "Two", "B", "tech house", "126", "9A");
+    write_tagged(&dir.0.join("c.wav"), "Three", "C", "Disco", "110", "3B");
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let all = library.tracks(&TrackQuery::default()).unwrap();
+    let id = |title: &str| all.iter().find(|t| t.title == title).unwrap().id;
+    // What mixes after One: Two (next key, close tempo), not Three.
+    let next = library.suggest_next(id("One"), 10).unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].track.title, "Two");
+    assert_eq!(next[0].key_fit, KeyFit::Adjacent);
+    assert!((next[0].tempo_change - (124.0 / 126.0 - 1.0) * 100.0).abs() < 1e-9);
 }
 
 #[test]
