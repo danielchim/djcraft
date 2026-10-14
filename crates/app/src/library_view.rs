@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 use djcraft_analysis::TempoRange;
 use djcraft_library::lookup::Provider;
 use djcraft_library::{
-    Camelot, FolderWatcher, ImportSummary, Library, Playlist, Source, SourceKind, TempoResult,
-    Track, TrackEdit, TrackQuery, read_artwork, read_playlists,
+    AlignOptions, ApplySummary, Camelot, Cleanup, FolderWatcher, ImportSummary, Library,
+    PlannedChange, Playlist, Source, SourceKind, TempoResult, Track, TrackEdit, TrackQuery,
+    read_artwork, read_playlists,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -26,6 +27,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::lookup_view::{LookupEvent, LookupField, LookupView};
+use crate::tag_tools::{FormEvent, RenameForm, ReplaceForm, ReviewEvent, ReviewView};
 
 /// How often the track list is refreshed while a scan is running.
 const SCAN_REFRESH: Duration = Duration::from_millis(400);
@@ -1057,7 +1059,7 @@ impl LibraryView {
         cx.notify();
     }
 
-    /// Writes the info panel's values to the file's tags and the library.
+    /// Shows what Save would write to the file, for the user to confirm.
     fn save_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(track), Some(library)) = (&self.inspected, &self.library) else {
             return;
@@ -1080,26 +1082,299 @@ impl LibraryView {
             genre: self.field_text(EditField::Genre, cx),
             bpm,
             key: Some(self.field_text(EditField::Key, cx)).filter(|key| !key.is_empty()),
+            comment: None,
+            grouping: None,
         };
-        match library.edit_track(id, &edit) {
-            Ok(()) => {
-                self.error = None;
-                self.reload(cx);
-                let saved = self
-                    .table
-                    .read(cx)
-                    .delegate()
-                    .tracks
-                    .iter()
-                    .find(|t| t.id == id);
-                if let Some(saved) = saved.cloned() {
-                    self.inspect(saved, window, cx);
-                }
-                self.notice = Some("Saved to the file's tags.".into());
+        match library.plan_edit(id, &edit) {
+            Ok(change) if change.is_empty() => {
+                self.editing = false;
+                self.notice = Some("Nothing to save: the file already says this.".into());
             }
+            Ok(change) => self.review("Edit track details".into(), vec![change], window, cx),
             Err(error) => self.error = Some(error.to_string().into()),
         }
         cx.notify();
+    }
+
+    /// The tracks a tag tool works on: those in the list as it is shown.
+    fn listed_ids(&self, cx: &App) -> Vec<i64> {
+        self.table
+            .read(cx)
+            .delegate()
+            .tracks
+            .iter()
+            .map(|track| track.id)
+            .collect()
+    }
+
+    /// Plans a tag tool's changes for the listed tracks and shows them.
+    fn run_tool(
+        &mut self,
+        label: &str,
+        plan: impl FnOnce(&Library, &[i64]) -> djcraft_library::Result<Vec<PlannedChange>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ids = self.listed_ids(cx);
+        let Some(library) = &self.library else {
+            return;
+        };
+        match plan(library, &ids) {
+            Ok(changes) if changes.is_empty() => {
+                self.notice = Some(format!("{label}: nothing to change.").into());
+            }
+            Ok(changes) => self.review(label.to_string(), changes, window, cx),
+            Err(error) => self.error = Some(error.to_string().into()),
+        }
+        cx.notify();
+    }
+
+    /// Opens the review of planned changes; confirming it writes them.
+    fn review(
+        &mut self,
+        label: String,
+        changes: Vec<PlannedChange>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let count = changes.len();
+        let review = cx.new(|_| ReviewView::new(label.clone(), changes));
+        cx.subscribe_in(
+            &review,
+            window,
+            |this, _, event: &ReviewEvent, window, cx| {
+                if let ReviewEvent::Apply(label, changes) = event {
+                    this.write_changes(label.clone(), changes.clone(), window, cx);
+                }
+                window.close_dialog(cx);
+            },
+        )
+        .detach();
+        let title = format!(
+            "{label}: review {count} file{}",
+            if count == 1 { "" } else { "s" }
+        );
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title(title.clone())
+                .w(px(760.))
+                .child(review.clone())
+        });
+    }
+
+    /// Writes reviewed changes on a background thread, then shows the
+    /// result.
+    fn write_changes(
+        &mut self,
+        label: String,
+        changes: Vec<PlannedChange>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let db_path = self.db_path.clone();
+        let work =
+            cx.background_spawn(
+                async move { Library::open(&db_path)?.apply_changes(&label, &changes) },
+            );
+        self.notice = Some("Writing tags…".into());
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = work.await;
+            this.update_in(cx, |this, window, cx| {
+                this.written(result, "Wrote", window, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Undoes the most recent batch of tag changes.
+    fn undo_last(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(batch) = self
+            .library
+            .as_ref()
+            .and_then(|library| library.last_batch().ok().flatten())
+        else {
+            self.notice = Some("There is nothing to undo.".into());
+            cx.notify();
+            return;
+        };
+        let db_path = self.db_path.clone();
+        let work =
+            cx.background_spawn(async move { Library::open(&db_path)?.undo_batch(batch.id) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = work.await;
+            this.update_in(cx, |this, window, cx| {
+                this.written(result, "Undid", window, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Reports how writing or undoing went, and shows the new tags.
+    fn written(
+        &mut self,
+        result: djcraft_library::Result<ApplySummary>,
+        verb: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let notice = match result {
+            Ok(summary) => {
+                let files = |count: usize| match count {
+                    1 => "1 file".to_string(),
+                    count => format!("{count} files"),
+                };
+                let mut notice = format!("{verb} {}.", files(summary.written));
+                if let Some((path, why)) = summary.skipped.first() {
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    notice.push_str(&format!(
+                        " Skipped {}: {name}, because {why}.",
+                        files(summary.skipped.len())
+                    ));
+                }
+                self.error = None;
+                Some(notice)
+            }
+            Err(error) => {
+                self.error = Some(error.to_string().into());
+                None
+            }
+        };
+        self.editing = false;
+        self.reload(cx);
+        // The info panel shows the track as its file now is.
+        if let Some(id) = self.inspected.as_ref().map(|track| track.id) {
+            let fresh = self.library.as_ref().and_then(|library| {
+                let query = TrackQuery {
+                    id: Some(id),
+                    ..Default::default()
+                };
+                library.tracks(&query).ok()?.pop()
+            });
+            match fresh {
+                Some(track) => self.inspect(track, window, cx),
+                None => self.inspected = None,
+            }
+        }
+        // Set last, as opening the track again clears it.
+        self.notice = notice.map(Into::into);
+        cx.emit(LibraryEvent::Changed);
+        cx.notify();
+    }
+
+    /// Opens a form that sets up a tag tool, and then its review.
+    fn open_form<F: EventEmitter<FormEvent> + Render>(
+        &mut self,
+        title: &'static str,
+        form: Entity<F>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.subscribe_in(&form, window, |this, _, event: &FormEvent, window, cx| {
+            window.close_dialog(cx);
+            match event {
+                FormEvent::Replace(cleanup) => {
+                    let cleanup = cleanup.clone();
+                    this.run_tool(
+                        "Find and replace",
+                        |library, ids| library.plan_cleanup(ids, &cleanup),
+                        window,
+                        cx,
+                    );
+                }
+                FormEvent::Rename(template) => {
+                    let template = template.clone();
+                    this.run_tool(
+                        "Rename files",
+                        |library, ids| library.plan_rename(ids, &template),
+                        window,
+                        cx,
+                    );
+                }
+                FormEvent::Cancel => {}
+            }
+        })
+        .detach();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog.title(title).w(px(520.)).child(form.clone())
+        });
+    }
+
+    /// The Tag tools menu: changes to the tags of every track in the list.
+    fn tag_tools_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.weak_entity();
+        let undo = self
+            .library
+            .as_ref()
+            .and_then(|library| library.last_batch().ok().flatten())
+            .map(|batch| format!("Undo \"{}\" ({} files)", batch.label, batch.files));
+        Button::new("tag-tools")
+            .outline()
+            .icon(IconName::Tags)
+            .label("Tag tools")
+            .dropdown_caret(true)
+            .dropdown_menu(move |menu, _, _| {
+                let item = |label: String, run: fn(&mut LibraryView, &mut Window, &mut Context<LibraryView>)| {
+                    let view = view.clone();
+                    PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                        view.update(cx, |view, cx| run(view, window, cx)).ok();
+                    })
+                };
+                let mut menu = menu
+                    .label("Applies to every track in the list")
+                    .item(item("Write BPM, key and energy…".into(), |this, window, cx| {
+                        let settings = cx
+                            .try_global::<crate::settings::Settings>()
+                            .cloned()
+                            .unwrap_or_default();
+                        let options = AlignOptions {
+                            bpm: true,
+                            key: settings.key_placement,
+                            energy: settings.energy_placement,
+                        };
+                        this.run_tool(
+                            "Write BPM, key and energy",
+                            |library, ids| library.plan_align(ids, &options),
+                            window,
+                            cx,
+                        );
+                    }))
+                    .item(item("Find and replace…".into(), |this, window, cx| {
+                        let form = cx.new(|cx| ReplaceForm::new(window, cx));
+                        this.open_form("Find and replace", form, window, cx);
+                    }))
+                    .item(item("Remove extra spaces…".into(), |this, window, cx| {
+                        this.run_tool(
+                            "Remove extra spaces",
+                            |library, ids| library.plan_cleanup(ids, &Cleanup::ExtraSpaces),
+                            window,
+                            cx,
+                        );
+                    }))
+                    .item(item("Fix capitalisation…".into(), |this, window, cx| {
+                        this.run_tool(
+                            "Fix capitalisation",
+                            |library, ids| library.plan_cleanup(ids, &Cleanup::Capitalise),
+                            window,
+                            cx,
+                        );
+                    }))
+                    .item(item("Rename files from tags…".into(), |this, window, cx| {
+                        let form = cx.new(|cx| RenameForm::new(window, cx));
+                        this.open_form("Rename files from tags", form, window, cx);
+                    }));
+                if let Some(undo) = undo.clone() {
+                    menu = menu
+                        .separator()
+                        .item(item(undo, |this, window, cx| this.undo_last(window, cx)));
+                }
+                menu
+            })
     }
 
     /// Chooses where "Look up" searches.
@@ -2190,6 +2465,7 @@ impl LibraryView {
                             .text_color(cx.theme().muted_foreground)
                             .child(status),
                     )
+                    .when(!self.compact, |this| this.child(self.tag_tools_button(cx)))
                     .when(self.wheel_in_browser, |this| {
                         this.child(self.wheel_button(cx))
                     }),

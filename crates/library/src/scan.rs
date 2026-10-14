@@ -6,6 +6,7 @@ use lofty::config::WriteOptions;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::tag::{Accessor, ItemKey, Tag, TagExt};
 use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
 
 use crate::{Error, Library, Result, SourceKind};
 
@@ -39,8 +40,8 @@ struct Tags {
     key: Option<String>,
 }
 
-/// New values for a track's editable details.
-#[derive(Clone, Debug, PartialEq)]
+/// The details djcraft reads from and writes to a file's tags.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TrackEdit {
     pub title: String,
     pub artist: String,
@@ -48,6 +49,12 @@ pub struct TrackEdit {
     pub genre: String,
     pub bpm: Option<f64>,
     pub key: Option<String>,
+    /// `None` leaves the file's comment as it is.
+    #[serde(default)]
+    pub comment: Option<String>,
+    /// The grouping (content group) field. `None` leaves it as it is.
+    #[serde(default)]
+    pub grouping: Option<String>,
 }
 
 /// Cover art embedded in a file.
@@ -67,9 +74,39 @@ pub fn read_artwork(path: &Path) -> Option<Artwork> {
     })
 }
 
-/// Writes edited details into a file's own tags, leaving everything else in
-/// the tag (artwork, comments and so on) as it was.
-fn write_tags(path: &Path, edit: &TrackEdit) -> Result<()> {
+/// What a file's tags say, as they say it: an empty title stays empty
+/// rather than taking the file's name.
+pub(crate) fn read_file_tags(path: &Path) -> Result<TrackEdit> {
+    let file = lofty::read_from_path(path).map_err(|e| Error::Tags(e.to_string()))?;
+    let Some(tag) = file.primary_tag().or_else(|| file.first_tag()) else {
+        return Ok(TrackEdit {
+            comment: Some(String::new()),
+            grouping: Some(String::new()),
+            ..TrackEdit::default()
+        });
+    };
+    let text = |value: Option<std::borrow::Cow<'_, str>>| {
+        value.map(|v| v.trim().to_string()).unwrap_or_default()
+    };
+    let item = |key: ItemKey| tag.get_string(key).map(|v| v.trim().to_string());
+    Ok(TrackEdit {
+        title: text(tag.title()),
+        artist: text(tag.artist()),
+        album: text(tag.album()),
+        genre: text(tag.genre()),
+        bpm: item(ItemKey::Bpm)
+            .or_else(|| item(ItemKey::IntegerBpm))
+            .and_then(|bpm| bpm.parse::<f64>().ok())
+            .filter(|bpm| *bpm > 0.0),
+        key: item(ItemKey::InitialKey).filter(|key| !key.is_empty()),
+        comment: Some(text(tag.comment())),
+        grouping: Some(item(ItemKey::ContentGroup).unwrap_or_default()),
+    })
+}
+
+/// Writes details into a file's own tags, leaving everything else in the
+/// tag (artwork, other fields) as it was.
+pub(crate) fn write_tags(path: &Path, edit: &TrackEdit) -> Result<()> {
     let file = lofty::read_from_path(path).map_err(|e| Error::Tags(e.to_string()))?;
     let mut tag = file
         .primary_tag()
@@ -111,6 +148,18 @@ fn write_tags(path: &Path, edit: &TrackEdit) -> Result<()> {
     tag.remove_key(ItemKey::InitialKey);
     if let Some(key) = edit.key.as_deref().and_then(text) {
         tag.insert_text(ItemKey::InitialKey, key);
+    }
+    if let Some(comment) = &edit.comment {
+        match text(comment) {
+            Some(comment) => tag.set_comment(comment),
+            None => tag.remove_comment(),
+        }
+    }
+    if let Some(grouping) = &edit.grouping {
+        tag.remove_key(ItemKey::ContentGroup);
+        if let Some(grouping) = text(grouping) {
+            tag.insert_text(ItemKey::ContentGroup, grouping);
+        }
     }
     tag.save_to_path(path, WriteOptions::default())
         .map_err(|e| Error::Tags(e.to_string()))
@@ -163,71 +212,6 @@ pub(crate) fn store_track(
 }
 
 impl Library {
-    /// Changes a track's details. They are written to the file's tags
-    /// first, so the file stays the record of what the track is.
-    pub fn edit_track(&self, id: i64, edit: &TrackEdit) -> Result<()> {
-        type Row = (
-            i64,
-            String,
-            String,
-            Option<f64>,
-            Option<String>,
-            Option<i64>,
-        );
-        let (source_id, root, locator, shown_bpm, shown_key, tempo_version): Row =
-            self.conn.query_row(
-                &format!(
-                    "SELECT t.source_id, s.location, t.locator, {}, {}, t.tempo_version
-                     FROM tracks t JOIN sources s ON s.id = t.source_id WHERE t.id = ?1",
-                    crate::shown_bpm_sql(),
-                    crate::shown_key_sql(),
-                ),
-                [id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                    ))
-                },
-            )?;
-        let path = Path::new(&root).join(&locator);
-        write_tags(&path, edit)?;
-        let stamp = file_stamp(&path)
-            .ok_or_else(|| Error::Tags(format!("{} disappeared", path.display())))?;
-        // Re-read what the file now says, rather than trust the request.
-        store_track(&self.conn, source_id, &locator, &path, stamp)?;
-        // Only the tags changed, so the audio need not be analysed again.
-        // A tempo the user typed in stands until they change it.
-        let same_bpm = match (edit.bpm, shown_bpm) {
-            (Some(new), Some(shown)) => (new - shown).abs() < 0.005,
-            (None, None) => true,
-            _ => false,
-        };
-        self.conn.execute(
-            "UPDATE tracks SET tempo_version = ?2 WHERE id = ?1",
-            params![id, tempo_version],
-        )?;
-        if !same_bpm {
-            self.conn
-                .execute("UPDATE tracks SET bpm_manual = 1 WHERE id = ?1", [id])?;
-        }
-        // The same for a key: one typed in stands over a detected one.
-        let typed_key = edit
-            .key
-            .as_deref()
-            .map(str::trim)
-            .filter(|key| !key.is_empty());
-        if typed_key != shown_key.as_deref() {
-            self.conn
-                .execute("UPDATE tracks SET key_manual = 1 WHERE id = ?1", [id])?;
-        }
-        Ok(())
-    }
-
     /// Brings a source up to date with what is on disk: new files are added,
     /// changed files re-read, and missing files removed. Files whose size
     /// and modification time are unchanged are not opened.
@@ -315,7 +299,7 @@ impl Library {
     }
 }
 
-fn unix_seconds(time: SystemTime) -> i64 {
+pub(crate) fn unix_seconds(time: SystemTime) -> i64 {
     time.duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)

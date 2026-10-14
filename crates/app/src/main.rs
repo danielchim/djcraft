@@ -5,6 +5,7 @@ mod lookup_view;
 mod settings;
 mod settings_view;
 mod shell;
+mod tag_tools;
 mod waveform;
 
 use gpui_kit::assets::AllAssets;

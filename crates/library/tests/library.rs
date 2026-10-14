@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use djcraft_library::{
-    Camelot, ClipPlacement, CuePoint, FolderWatcher, ImportSummary, KeepTagged, KeyResult, Library,
-    ScanSummary, SourceKind, TempoResult, TrackEdit, TrackQuery, read_artwork, read_playlists,
+    AlignOptions, Camelot, Cleanup, ClipPlacement, CuePoint, FolderWatcher, ImportSummary,
+    KeepTagged, KeyResult, Library, Placement, ScanSummary, SourceKind, TagField, TempoResult,
+    TrackEdit, TrackQuery, read_artwork, read_playlists,
 };
 use lofty::config::WriteOptions;
 use lofty::tag::{Accessor, ItemKey, Tag, TagExt, TagType};
@@ -396,7 +397,8 @@ fn an_existing_library_gains_playlists_on_upgrade() {
     // Put the file back to how the first schema left it.
     let raw = rusqlite::Connection::open(&db).unwrap();
     raw.execute_batch(
-        "DROP TABLE playlist_tracks; DROP TABLE playlists;
+        "DROP TABLE tag_history; DROP TABLE tag_batches;
+         DROP TABLE playlist_tracks; DROP TABLE playlists;
          DROP TABLE options;
          ALTER TABLE tracks DROP COLUMN tempo_downbeat;
          ALTER TABLE tracks DROP COLUMN key_manual;
@@ -641,6 +643,8 @@ fn editing_a_track_writes_its_tags() {
         album: "The Album".into(),
         genre: String::new(),
         bpm: Some(127.5),
+        comment: None,
+        grouping: None,
         key: Some("8A".into()),
     };
     let tagged = find(&library, "Old");
@@ -748,6 +752,8 @@ fn measured_tempo_is_stored_and_shown() {
         album: String::new(),
         genre: String::new(),
         bpm: Some(128.02),
+        comment: None,
+        grouping: None,
         key: None,
     };
     library.edit_track(tagged, &edit).unwrap();
@@ -944,6 +950,8 @@ fn tagged_tempo_and_key_can_be_kept_over_measured_ones() {
         album: String::new(),
         genre: String::new(),
         bpm: Some(126.0),
+        comment: None,
+        grouping: None,
         key: Some("5A".into()),
     };
     library.edit_track(tagged, &edit).unwrap();
@@ -953,6 +961,163 @@ fn tagged_tempo_and_key_can_be_kept_over_measured_ones() {
     assert!(library.pending_tempo_analysis(1).unwrap().is_empty());
     assert_eq!(library.reset_analysis().unwrap(), 2);
     assert_eq!(library.pending_tempo_analysis(1).unwrap().len(), 2);
+}
+
+#[test]
+fn batch_tag_changes_are_reviewed_applied_and_undone() {
+    let dir = TempDir::new("batch-tags");
+    write_tagged(&dir.0.join("a.wav"), "losing  it", "fisher", "", "", "");
+    write_tagged(
+        &dir.0.join("b.wav"),
+        "One More Time (Original Mix)",
+        "Daft Punk",
+        "",
+        "",
+        "",
+    );
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let ids: Vec<i64> = library
+        .tracks(&TrackQuery::default())
+        .unwrap()
+        .iter()
+        .map(|t| t.id)
+        .collect();
+    let titles = |library: &Library| titles(library, "");
+
+    // Clean-up: spaces, then capitals, each a batch of its own.
+    let spaces = library.plan_cleanup(&ids, &Cleanup::ExtraSpaces).unwrap();
+    assert_eq!(spaces.len(), 1);
+    assert_eq!(
+        spaces[0].differences(),
+        [("Title", "losing  it".to_string(), "losing it".to_string())]
+    );
+    let applied = library
+        .apply_changes("Remove extra spaces", &spaces)
+        .unwrap();
+    assert_eq!((applied.written, applied.skipped.len()), (1, 0));
+    let capitals = library.plan_cleanup(&ids, &Cleanup::Capitalise).unwrap();
+    library
+        .apply_changes("Fix capitalisation", &capitals)
+        .unwrap();
+    assert_eq!(
+        titles(&library),
+        ["One More Time (Original Mix)", "Losing It"]
+    );
+
+    // Find and replace, in the chosen fields only.
+    let replace = Cleanup::Replace {
+        find: "original mix".into(),
+        replace: "Extended Mix".into(),
+        fields: vec![TagField::Title],
+        match_case: false,
+    };
+    let planned = library.plan_cleanup(&ids, &replace).unwrap();
+    library.apply_changes("Replace", &planned).unwrap();
+    assert!(titles(&library).contains(&"One More Time (Extended Mix)".to_string()));
+
+    // The last batch can be undone, then the one before it.
+    let last = library.last_batch().unwrap().unwrap();
+    assert_eq!((last.label.as_str(), last.files), ("Replace", 1));
+    library.undo_batch(last.id).unwrap();
+    assert!(titles(&library).contains(&"One More Time (Original Mix)".to_string()));
+    let before = library.last_batch().unwrap().unwrap();
+    assert_eq!(before.label, "Fix capitalisation");
+    library.undo_batch(before.id).unwrap();
+    assert_eq!(
+        titles(&library),
+        ["One More Time (Original Mix)", "losing it"]
+    );
+
+    // A file changed after review is left alone.
+    let stale = library.plan_cleanup(&ids, &Cleanup::Capitalise).unwrap();
+    write_tagged(
+        &dir.0.join("a.wav"),
+        "edited elsewhere",
+        "fisher",
+        "",
+        "",
+        "",
+    );
+    let applied = library.apply_changes("Stale", &stale).unwrap();
+    assert_eq!(applied.written, 0);
+    assert_eq!(applied.skipped.len(), 1);
+    library.scan(source.id, |_| {}).unwrap();
+
+    // Analysis written into the tags, where the options say.
+    let fisher = library
+        .tracks(&TrackQuery::default())
+        .unwrap()
+        .into_iter()
+        .find(|t| t.artist == "fisher")
+        .unwrap();
+    library
+        .store_tempo(
+            fisher.id,
+            1,
+            Some(TempoResult {
+                bpm: 125.004,
+                first_beat_seconds: 0.0,
+                downbeat: 0,
+                confidence: 0.9,
+            }),
+        )
+        .unwrap();
+    library
+        .store_key(
+            fisher.id,
+            Some(KeyResult {
+                key: Camelot::parse("8A").unwrap(),
+                confidence: 0.9,
+            }),
+        )
+        .unwrap();
+    library.store_structure(fisher.id, Some(7), &[]).unwrap();
+    let options = AlignOptions {
+        bpm: true,
+        key: Placement::KeyField,
+        energy: Placement::Comment,
+    };
+    let planned = library.plan_align(&[fisher.id], &options).unwrap();
+    let applied = library.apply_changes("Write analysis", &planned).unwrap();
+    assert_eq!(applied.written, 1);
+    let (_, tags) = library.file_tags(fisher.id).unwrap();
+    assert_eq!(tags.bpm, Some(125.0));
+    assert_eq!(tags.key.as_deref(), Some("8A"));
+    assert_eq!(tags.comment.as_deref(), Some("Energy 7"));
+    // Writing what was measured does not mark it as typed in.
+    assert!(
+        library
+            .plan_align(&[fisher.id], &options)
+            .unwrap()
+            .is_empty()
+    );
+
+    // Files renamed from their details, in their folder, and back.
+    let planned = library.plan_rename(&ids, "{artist} - {title}").unwrap();
+    assert_eq!(planned.len(), 2);
+    library.apply_changes("Rename", &planned).unwrap();
+    let mut names: Vec<String> = std::fs::read_dir(&dir.0)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "Daft Punk - One More Time (Original Mix).wav",
+            "fisher - edited elsewhere.wav"
+        ]
+    );
+    // The library follows the new names, so a scan finds nothing to do.
+    let scan = library.scan(source.id, |_| {}).unwrap();
+    assert_eq!((scan.added, scan.removed), (0, 0));
+    let rename = library.last_batch().unwrap().unwrap();
+    library.undo_batch(rename.id).unwrap();
+    assert!(dir.0.join("a.wav").exists() && dir.0.join("b.wav").exists());
+    let scan = library.scan(source.id, |_| {}).unwrap();
+    assert_eq!((scan.added, scan.removed), (0, 0));
 }
 
 #[test]

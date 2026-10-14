@@ -8,6 +8,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use djcraft_library::Placement;
 use djcraft_library::lookup::Provider;
 
 use crate::settings::{self, Settings, StartTab, ThemeChoice, data_dir};
@@ -397,6 +398,40 @@ impl SettingsView {
                     ],
                     cx,
                 );
+                let key_place = self.dropdown(
+                    "key-placement",
+                    self.settings.key_placement,
+                    &Placement::FOR_KEY,
+                    Placement::label,
+                    |settings, place| settings.key_placement = place,
+                    cx,
+                );
+                let energy_place = self.dropdown(
+                    "energy-placement",
+                    self.settings.energy_placement,
+                    &Placement::FOR_ENERGY,
+                    Placement::label,
+                    |settings, place| settings.energy_placement = place,
+                    cx,
+                );
+                let tags = self.section(
+                    "Tags",
+                    vec![
+                        self.row(
+                            "Write the key to",
+                            "Where Tag tools, Write BPM, key and energy puts the key, in Camelot notation such as 8A. Old keys it wrote there are replaced.",
+                            key_place,
+                            cx,
+                        ),
+                        self.row(
+                            "Write the energy to",
+                            "Where the energy level goes, written as Energy 7. Files have no field of their own for it.",
+                            energy_place,
+                            cx,
+                        ),
+                    ],
+                    cx,
+                );
                 let music_info = self.section(
                     "Music info",
                     vec![self.row(
@@ -430,7 +465,7 @@ impl SettingsView {
                         ),
                     ],
                     cx,
-                ), analysis, music_info]
+                ), analysis, tags, music_info]
             }
             Page::Assistant => vec![self.section(
                 "Assistant",

@@ -2,8 +2,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use djcraft_analysis::TempoRange;
-use djcraft_library::KeepTagged;
 use djcraft_library::lookup::Provider;
+use djcraft_library::{KeepTagged, Placement};
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{App, Global};
 use serde::{Deserialize, Serialize};
@@ -110,6 +110,10 @@ pub struct Settings {
     pub keep_tagged_tempo: bool,
     /// List a file's tagged key instead of the detected one.
     pub keep_tagged_key: bool,
+    /// Where Tag tools write a track's key.
+    pub key_placement: Placement,
+    /// Where Tag tools write a track's energy.
+    pub energy_placement: Placement,
 }
 
 impl Global for Settings {}
@@ -168,6 +172,8 @@ impl Default for Settings {
             bpm_decimals: 1,
             keep_tagged_tempo: KeepTagged::default().tempo,
             keep_tagged_key: KeepTagged::default().key,
+            key_placement: Placement::KeyField,
+            energy_placement: Placement::Comment,
         }
     }
 }
@@ -237,6 +243,8 @@ mod tests {
             bpm_decimals: 2,
             keep_tagged_tempo: true,
             keep_tagged_key: false,
+            key_placement: Placement::TitlePrefix,
+            energy_placement: Placement::Grouping,
         };
         settings.save(&dir).unwrap();
         assert_eq!(Settings::load(&dir), settings);

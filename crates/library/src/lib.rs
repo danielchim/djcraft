@@ -10,6 +10,7 @@ mod flow;
 mod import;
 pub mod lookup;
 mod scan;
+mod tags;
 mod watch;
 
 use std::collections::HashMap;
@@ -27,9 +28,10 @@ pub use flow::{
 };
 pub use import::{ImportSummary, ImportedPlaylist, read_playlists};
 pub use scan::{Artwork, ScanProgress, ScanSummary, TrackEdit, read_artwork};
+pub use tags::{AlignOptions, ApplySummary, Cleanup, Placement, PlannedChange, TagBatch, TagField};
 pub use watch::FolderWatcher;
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 /// A measured tempo is shown only when the analysis was at least this sure
 /// of it. Below that (mixes with several tempos, music with no clear beat)
@@ -445,6 +447,30 @@ impl Library {
                      value INTEGER NOT NULL
                  );
                  PRAGMA user_version = 10;
+                 COMMIT;",
+            )?;
+        }
+        if version < 11 {
+            // Tag changes written together, with each file's old and new
+            // tags and names, so that a batch can be undone.
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE tag_batches (
+                     id INTEGER PRIMARY KEY,
+                     label TEXT NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     undone INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE tag_history (
+                     batch_id INTEGER NOT NULL REFERENCES tag_batches (id) ON DELETE CASCADE,
+                     track_id INTEGER REFERENCES tracks (id) ON DELETE SET NULL,
+                     path_before TEXT NOT NULL,
+                     path_after TEXT NOT NULL,
+                     before TEXT NOT NULL,
+                     after TEXT NOT NULL
+                 );
+                 CREATE INDEX tag_history_batch ON tag_history (batch_id);
+                 PRAGMA user_version = 11;
                  COMMIT;",
             )?;
         }
