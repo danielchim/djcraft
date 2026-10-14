@@ -19,6 +19,18 @@ impl Camelot {
         (1..=12).contains(&number).then_some(Self { number, major })
     }
 
+    /// The key whose home note is `tonic` semitones above C (0 is C, 9 is
+    /// A), in its major or minor form.
+    pub fn from_tonic(tonic: u8, major: bool) -> Self {
+        // A minor key shares its number with the major key three semitones up.
+        let relative = (tonic as u32 + if major { 0 } else { 3 }) % 12;
+        // Each step round the wheel is a fifth (seven semitones); C major is 8B.
+        Self {
+            number: ((relative * 7 + 7) % 12 + 1) as u8,
+            major,
+        }
+    }
+
     /// All 24 keys, by number and then minor before major.
     pub fn all() -> impl Iterator<Item = Camelot> {
         (1..=12).flat_map(|number| [false, true].map(|major| Camelot { number, major }))
@@ -67,11 +79,7 @@ impl Camelot {
             "m" | "min" | "minor" | "moll" => false,
             _ => return None,
         };
-        // A minor key shares its number with the major key three semitones up.
-        let tonic = (pitch + if major { 0 } else { 3 }).rem_euclid(12);
-        // Each step round the wheel is a fifth (seven semitones); C major is 8B.
-        let number = (tonic * 7 % 12 + 7) % 12 + 1;
-        Self::new(number as u8, major)
+        Some(Self::from_tonic(pitch.rem_euclid(12) as u8, major))
     }
 
     /// The keys that mix smoothly with this one: itself, one step either way
@@ -174,6 +182,9 @@ mod tests {
             assert_eq!(Camelot::parse(&key.name()), Some(key), "{key}");
             assert_eq!(Camelot::parse(&key.to_string()), Some(key));
         }
+        assert_eq!(Camelot::from_tonic(9, false), Camelot::parse("Am").unwrap());
+        assert_eq!(Camelot::from_tonic(0, true), Camelot::parse("C").unwrap());
+        assert_eq!(Camelot::from_tonic(6, true).name(), "F♯ major");
         assert_eq!(Camelot::parse("8A").unwrap().name(), "A minor");
         assert_eq!(Camelot::parse("2B").unwrap().name(), "F♯ major");
     }

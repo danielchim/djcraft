@@ -5,14 +5,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, mpsc};
 
-use djcraft_analysis::{TempoRange, detect_structure, detect_tempo};
+use djcraft_analysis::{TempoRange, detect_key, detect_structure, detect_tempo};
 use djcraft_engine::Track;
-use djcraft_library::{CuePoint, Library, TempoResult};
+use djcraft_library::{Camelot, CuePoint, KeyResult, Library, TempoResult};
 
 /// Raise this when the analysis changes enough that every track should be
-/// analysed again. Version 2 added energy and cue points.
-const ANALYSIS_VERSION: i64 = 2;
-/// Tempo does not need treble, and a lower rate is quicker to decode.
+/// analysed again. Version 2 added energy and cue points; version 3, key.
+const ANALYSIS_VERSION: i64 = 3;
+/// Tempo and key do not need treble, and a lower rate is quicker to decode.
 const ANALYSIS_RATE: u32 = 22_050;
 const MAX_WORKERS: usize = 4;
 
@@ -61,6 +61,7 @@ pub fn analyse_pending(db_path: &Path, progress: &Progress) -> djcraft_library::
         // Results are written from this one thread as they arrive.
         for (id, analysis) in received {
             library.store_structure(id, analysis.energy, &analysis.cues)?;
+            library.store_key(id, analysis.key)?;
             // Last, as this is what marks the track as analysed.
             library.store_tempo(id, ANALYSIS_VERSION, analysis.tempo)?;
             progress.done.fetch_add(1, Ordering::Relaxed);
@@ -72,6 +73,7 @@ pub fn analyse_pending(db_path: &Path, progress: &Progress) -> djcraft_library::
 #[derive(Default)]
 struct Analysis {
     tempo: Option<TempoResult>,
+    key: Option<KeyResult>,
     energy: Option<u8>,
     cues: Vec<CuePoint>,
 }
@@ -94,6 +96,10 @@ fn analyse(path: &Path) -> Analysis {
             bpm: tempo.bpm,
             first_beat_seconds: tempo.first_beat_seconds,
             confidence: tempo.confidence as f64,
+        }),
+        key: detect_key(&samples, ANALYSIS_RATE).map(|key| KeyResult {
+            key: Camelot::from_tonic(key.tonic, key.major),
+            confidence: key.confidence as f64,
         }),
         energy: structure.as_ref().map(|structure| structure.energy),
         cues: structure

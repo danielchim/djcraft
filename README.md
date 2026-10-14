@@ -72,7 +72,7 @@ Your music files are only changed when you press Save in the track info panel.
 |---|---|
 | `crates/protocol` | The control protocol: every user action and the session state |
 | `crates/engine` | Audio engine: decoding, decks, mixing, time-stretch. No UI code |
-| `crates/analysis` | Signal analysis on decoded audio: tempo and beat positions |
+| `crates/analysis` | Signal analysis on decoded audio: tempo, key, energy and cue points |
 | `crates/library` | Library database, scanning, tags, playlists, import, lookups |
 | `crates/app` | The desktop application |
 

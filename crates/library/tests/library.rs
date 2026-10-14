@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use djcraft_library::{
-    Camelot, ClipPlacement, CuePoint, FolderWatcher, ImportSummary, Library, ScanSummary,
-    SourceKind, TempoResult, TrackEdit, TrackQuery, read_artwork, read_playlists,
+    Camelot, ClipPlacement, CuePoint, FolderWatcher, ImportSummary, KeyResult, Library,
+    ScanSummary, SourceKind, TempoResult, TrackEdit, TrackQuery, read_artwork, read_playlists,
 };
 use lofty::config::WriteOptions;
 use lofty::tag::{Accessor, ItemKey, Tag, TagExt, TagType};
@@ -397,6 +397,8 @@ fn an_existing_library_gains_playlists_on_upgrade() {
     let raw = rusqlite::Connection::open(&db).unwrap();
     raw.execute_batch(
         "DROP TABLE playlist_tracks; DROP TABLE playlists;
+         ALTER TABLE tracks DROP COLUMN key_detected;
+         ALTER TABLE tracks DROP COLUMN key_confidence;
          ALTER TABLE tracks DROP COLUMN cues_manual;
          DROP TABLE cues; ALTER TABLE tracks DROP COLUMN energy;
          ALTER TABLE flow_clips DROP COLUMN key_shift;
@@ -415,6 +417,7 @@ fn an_existing_library_gains_playlists_on_upgrade() {
     let library = Library::open(&db).unwrap();
     assert_eq!(library.create_playlist("New").unwrap().name, "New");
     assert!(library.pending_tempo_analysis(1).unwrap().is_empty());
+    assert!(library.key_counts().unwrap().is_empty());
 }
 
 fn file_url(path: &Path) -> String {
@@ -802,6 +805,65 @@ fn tracks_can_be_counted_and_filtered_by_key() {
         (five.key.as_deref(), five.camelot),
         (Some("nonsense"), None)
     );
+}
+
+#[test]
+fn a_detected_key_stands_in_for_a_missing_tag() {
+    let dir = TempDir::new("detected-key");
+    write_tagged(&dir.0.join("a.wav"), "Tagged", "A", "", "120", "Am");
+    write_wav(&dir.0.join("b.wav"));
+    write_wav(&dir.0.join("c.wav"));
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let all = library.tracks(&TrackQuery::default()).unwrap();
+    let id_of = |title: &str| all.iter().find(|t| t.title == title).unwrap().id;
+    let key_of = |library: &Library, id: i64| {
+        let query = TrackQuery {
+            id: Some(id),
+            ..Default::default()
+        };
+        let track = library.tracks(&query).unwrap().remove(0);
+        (track.key, track.camelot.map(|key| key.to_string()))
+    };
+    let found = |key: &str, confidence: f64| {
+        Some(KeyResult {
+            key: Camelot::parse(key).unwrap(),
+            confidence,
+        })
+    };
+
+    // What the file's tags say is kept, whatever analysis makes of it.
+    library
+        .store_key(id_of("Tagged"), found("3B", 0.9))
+        .unwrap();
+    assert_eq!(
+        key_of(&library, id_of("Tagged")),
+        (Some("Am".into()), Some("8A".into()))
+    );
+
+    // A track with no key in its tags takes the detected one, if it is sure.
+    assert_eq!(key_of(&library, id_of("b")), (None, None));
+    library.store_key(id_of("b"), found("9A", 0.8)).unwrap();
+    assert_eq!(
+        key_of(&library, id_of("b")),
+        (Some("9A".into()), Some("9A".into()))
+    );
+    library.store_key(id_of("c"), found("5B", 0.2)).unwrap();
+    assert_eq!(key_of(&library, id_of("c")), (None, None));
+
+    // Detected keys count on the wheel and can be filtered by.
+    let counts = library.key_counts().unwrap();
+    assert_eq!(counts.get(&Camelot::parse("9A").unwrap()), Some(&1));
+    assert_eq!(counts.len(), 2);
+    let query = TrackQuery {
+        keys: Camelot::parse("8A").unwrap().compatible().to_vec(),
+        ..Default::default()
+    };
+    assert_eq!(library.tracks(&query).unwrap().len(), 2);
+
+    library.store_key(id_of("b"), None).unwrap();
+    assert_eq!(key_of(&library, id_of("b")), (None, None));
 }
 
 #[test]

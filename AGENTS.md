@@ -24,8 +24,8 @@ alone.
 
 - `crates/protocol`: control protocol types. Pure data, no I/O.
 - `crates/engine`: audio engine. Must not depend on any UI crate.
-- `crates/analysis`: DSP on decoded samples (tempo so far). No file or
-  database access; the app decodes, analyses and stores.
+- `crates/analysis`: DSP on decoded samples (tempo, key, energy and cue
+  points). No file or database access. The app decodes, analyses and stores.
 - `crates/library`: SQLite library, scanning, tags, playlists, import, lookups.
 - `crates/app`: the GPUI application. `shell.rs` is the window, `library_view.rs`
   the Library tab and the track browser, `flow_view.rs` the Flow timeline editor, `settings_view.rs` the settings dialog.

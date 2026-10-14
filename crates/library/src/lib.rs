@@ -29,12 +29,16 @@ pub use import::{ImportSummary, ImportedPlaylist, read_playlists};
 pub use scan::{Artwork, ScanProgress, ScanSummary, TrackEdit, read_artwork};
 pub use watch::FolderWatcher;
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// A measured tempo is shown only when the analysis was at least this sure
 /// of it. Below that (mixes with several tempos, music with no clear beat)
 /// the tempo in the file's tags is shown instead.
 const MIN_TEMPO_CONFIDENCE: f64 = 0.1;
+/// A detected key is shown only when the track's notes fit it at least this
+/// well. Below that (drum tracks, speech, music that changes key) the track
+/// is left without one.
+const MIN_KEY_CONFIDENCE: f64 = 0.5;
 
 #[derive(Debug)]
 pub enum Error {
@@ -120,9 +124,11 @@ pub struct Track {
     /// The measured tempo when there is a trustworthy one, otherwise the
     /// tempo from the file's tags.
     pub bpm: Option<f64>,
-    /// The key as the file's tags spell it.
+    /// The key as the file's tags spell it. For a file with no key in its
+    /// tags, the detected key when there is a trustworthy one, in Camelot
+    /// notation.
     pub key: Option<String>,
-    /// The key's place on the Camelot wheel, when the tag can be understood.
+    /// The key's place on the Camelot wheel, when it can be understood.
     pub camelot: Option<Camelot>,
     /// Energy of the track as a whole, 1 to 10, once analysed.
     pub energy: Option<u8>,
@@ -134,6 +140,14 @@ pub struct CuePoint {
     pub seconds: f64,
     /// Energy of the section that starts here, 1 to 10.
     pub energy: u8,
+}
+
+/// What key analysis found for a track.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KeyResult {
+    pub key: Camelot,
+    /// 0.0 to 1.0.
+    pub confidence: f64,
 }
 
 /// What tempo analysis found for a track.
@@ -334,6 +348,18 @@ impl Library {
                  COMMIT;",
             )?;
         }
+        if version < 9 {
+            // The key found by analysis, in Camelot notation. It stands in
+            // for a key the file's tags do not give; `key` stays what the
+            // tags say.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE tracks ADD COLUMN key_detected TEXT;
+                 ALTER TABLE tracks ADD COLUMN key_confidence REAL;
+                 PRAGMA user_version = 9;
+                 COMMIT;",
+            )?;
+        }
         Ok(Self { conn })
     }
 
@@ -368,6 +394,19 @@ impl Library {
                 tempo.map(|t| t.first_beat_seconds),
                 tempo.map(|t| t.confidence),
                 version
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Records the outcome of key analysis; `None` when no key was found.
+    pub fn store_key(&self, id: i64, key: Option<KeyResult>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tracks SET key_detected = ?2, key_confidence = ?3 WHERE id = ?1",
+            params![
+                id,
+                key.map(|k| k.key.to_string()),
+                key.map(|k| k.confidence)
             ],
         )?;
         Ok(())
@@ -589,7 +628,8 @@ impl Library {
                     t.genre, t.duration,
                     CASE WHEN t.bpm_manual = 0 AND t.tempo_confidence >= ?3
                          THEN t.tempo_bpm ELSE t.bpm END,
-                    t.key, t.energy, s.name, s.kind
+                    COALESCE(t.key, CASE WHEN t.key_confidence >= ?5 THEN t.key_detected END),
+                    t.energy, s.name, s.kind
              FROM tracks t JOIN sources s ON s.id = t.source_id
              LEFT JOIN playlist_tracks pt ON pt.track_id = t.id AND pt.playlist_id = ?2
              WHERE (?1 IS NULL OR t.source_id = ?1) AND (?2 IS NULL OR pt.track_id IS NOT NULL)
@@ -600,6 +640,7 @@ impl Library {
             query.playlist.into(),
             MIN_TEMPO_CONFIDENCE.into(),
             query.id.into(),
+            MIN_KEY_CONFIDENCE.into(),
         ];
         for word in query.search.split_whitespace() {
             let escaped = word
@@ -653,13 +694,15 @@ impl Library {
 
     /// How many tracks the library has in each key.
     pub fn key_counts(&self) -> Result<HashMap<Camelot, usize>> {
-        let mut statement = self
-            .conn
-            .prepare("SELECT key FROM tracks WHERE key IS NOT NULL")?;
-        let keys = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut statement = self.conn.prepare(
+            "SELECT COALESCE(key, CASE WHEN key_confidence >= ?1 THEN key_detected END)
+             FROM tracks",
+        )?;
+        let keys =
+            statement.query_map([MIN_KEY_CONFIDENCE], |row| row.get::<_, Option<String>>(0))?;
         let mut counts = HashMap::new();
         for key in keys {
-            if let Some(key) = Camelot::parse(&key?) {
+            if let Some(key) = key?.as_deref().and_then(Camelot::parse) {
                 *counts.entry(key).or_insert(0) += 1;
             }
         }

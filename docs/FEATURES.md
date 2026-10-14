@@ -51,7 +51,8 @@ Status key: `[ ]` to do, `[~]` in progress, `[x]` done.
 - [~] BPM and beat grid detection (constant-tempo tracks, analysed in the
       background; the grid is stored but not drawn yet, and bars are not
       detected)
-- [ ] Key detection
+- [~] Key detection (one key per track, major or minor; tested on
+      synthetic music only, so accuracy on real tracks is not measured yet)
 - [ ] Waveform generation (overview and detail)
 - [~] Analysis cache stored alongside the library database (tempo results
       are in the library database; waveforms are in the user cache folder)
@@ -64,7 +65,8 @@ Feature set modelled on Mixed In Key 10.
 
 - [~] Camelot wheel notation, with a choice of notation (Camelot, musical,
       Open Key) and optional zero-padding (`08A`) (keys in tags are read in
-      any of the three and shown as Camelot; no choice of notation yet)
+      any of the three and shown as Camelot, as are detected keys; no choice
+      of notation yet)
 - [ ] Key segments: key changes within a track, each with a confidence value
 - [ ] Tuning detection for tracks not pitched to A440
 - [~] Energy level per track on a 1–10 scale (from loudness, so loudly

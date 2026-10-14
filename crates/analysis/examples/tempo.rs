@@ -1,14 +1,14 @@
-//! Prints the detected tempo, energy and cue points of audio files.
+//! Prints the detected tempo, key, energy and cue points of audio files.
 //!
 //!     cargo run -p djcraft-analysis --example tempo -- <file>...
 
 use std::path::Path;
 use std::time::Instant;
 
-use djcraft_analysis::{TempoRange, detect_structure, detect_tempo};
+use djcraft_analysis::{TempoRange, detect_key, detect_structure, detect_tempo};
 use djcraft_engine::Track;
 
-/// Tempo does not need treble, and a lower rate is quicker to decode.
+/// Tempo and key do not need treble, and a lower rate is quicker to decode.
 const ANALYSIS_RATE: u32 = 22_050;
 
 fn main() {
@@ -39,6 +39,17 @@ fn main() {
                 })
                 .collect();
             println!("energy {}  cues {}", structure.energy, cues.join(", "));
+        }
+        if let Some(key) = detect_key(&samples, ANALYSIS_RATE) {
+            const NOTES: [&str; 12] = [
+                "C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B",
+            ];
+            println!(
+                "key {} {}  confidence {:.2}",
+                NOTES[key.tonic as usize % 12],
+                if key.major { "major" } else { "minor" },
+                key.confidence
+            );
         }
         match tempo {
             Some(tempo) => println!(
