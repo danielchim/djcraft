@@ -134,15 +134,19 @@ Feature set modelled on Mixed In Key 10.
 
 ### Organisation
 
-- [~] Track browser with virtualised table, sorting, column chooser, search
-      (no column chooser yet)
-- [~] Playlists and folders (create from a dialog, delete, add and remove
-      tracks, export; no rename, reordering or folders in the UI yet)
-- [ ] Smart playlists (rule-based)
-- [ ] Auto-classification by genre, energy and era
-- [ ] Key/BPM compatibility hints for the next track
-- [ ] Duplicate detection
-- [ ] Missing-file relocation
+- [x] Track browser with virtualised table, sorting, column chooser, search
+- [~] Playlists and folders (folders inside folders, rename, move, reorder
+      from a track's menu; no drag and drop yet)
+- [x] Smart playlists (rule-based) (title, artist, album, genre, BPM,
+      energy, year, key or keys that mix, and date added; every rule or any)
+- [x] Auto-classification by genre, energy and era (automatic groups in the
+      Library sidebar, from tags and analysis)
+- [x] Key/BPM compatibility hints for the next track ("Suggest next" in the
+      browser under the decks, for the track loaded last)
+- [x] Duplicate detection (same artist and title with about the same length,
+      or the same file size; copies leave the library, files stay on disk)
+- [x] Missing-file relocation (missing tracks are kept and marked; files
+      that move within a folder are followed by themselves)
 
 ### Interoperability
 

@@ -15,8 +15,14 @@ is the full plan, with the status of every item.
   track in a searchable, sortable table. Folders are watched, so files you
   add, change or remove show up while the app is open. Tags are read from MP3, FLAC, WAV,
   AIFF, M4A, OGG and Opus files.
-- **Playlists:** create playlists that mix tracks from any folder, and import
-  them from a rekordbox XML export, a VirtualDJ folder, or M3U files.
+- **Playlists:** create playlists that mix tracks from any folder, sort them
+  into folders, and import them from a rekordbox XML export, a VirtualDJ
+  folder, or M3U files. Smart playlists fill themselves from rules such as
+  genre, tempo and key.
+- **Organising:** the library sidebar groups tracks by genre, energy and
+  decade. Tools find duplicate tracks and relink files that moved. A track
+  whose file has gone stays in the library, marked missing, with its
+  playlists and cue points.
 - **Track info:** view a track's details and cover art, edit them, and look
   them up on MusicBrainz, the iTunes Store or Discogs, or by their sound
   with AcoustID. The lookup opens a popup that lists the matches, best
@@ -30,7 +36,8 @@ is the full plan, with the status of every item.
   waveform that you click to jump. Tracks become playable within a second
   or two while the rest decodes.
 - **Track browser:** the library and playlists sit under the decks; double-click
-  a track to load it.
+  a track to load it. "Suggest next" lists the tracks whose key and tempo
+  mix with the track loaded last.
 - **Analysis:** tracks are analysed in the background for BPM, beats, bars,
   key, energy and cue points, and their waveforms are made ahead of time.
   It assumes a steady tempo, four beats to the bar and a single key, as most
