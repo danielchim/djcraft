@@ -398,7 +398,9 @@ fn an_existing_library_gains_playlists_on_upgrade() {
     // Put the file back to how the first schema left it.
     let raw = rusqlite::Connection::open(&db).unwrap();
     raw.execute_batch(
-        "ALTER TABLE tracks DROP COLUMN year;
+        "ALTER TABLE playlists DROP COLUMN folder_id;
+         DROP TABLE playlist_folders;
+         ALTER TABLE tracks DROP COLUMN year;
          ALTER TABLE tracks DROP COLUMN year_checked;
          ALTER TABLE tracks DROP COLUMN missing;
          DROP TABLE tag_history; DROP TABLE tag_batches;
@@ -1262,6 +1264,48 @@ fn missing_files_are_kept_followed_and_found_again() {
     library.scan(loose.id, |_| {}).unwrap();
     assert_eq!(library.remove_missing().unwrap(), 1);
     assert_eq!(titles(&library, ""), ["Alpha"]);
+}
+
+#[test]
+fn playlists_have_folders_and_order() {
+    let dir = TempDir::new("folders");
+    write_tagged(&dir.0.join("a.wav"), "One", "A", "Tech House", "124", "8A");
+    write_tagged(&dir.0.join("b.wav"), "Two", "B", "tech house", "126", "9A");
+    write_tagged(&dir.0.join("c.wav"), "Three", "C", "Disco", "110", "3B");
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let all = library.tracks(&TrackQuery::default()).unwrap();
+    let id = |title: &str| all.iter().find(|t| t.title == title).unwrap().id;
+    // Folders hold playlists and other folders; deleting one keeps them.
+    let gigs = library.create_folder("Gigs", None).unwrap();
+    let summer = library.create_folder("Summer", Some(gigs.id)).unwrap();
+    let set = library.create_playlist("Opening").unwrap();
+    library.move_playlist(set.id, Some(summer.id)).unwrap();
+    assert!(library.move_folder(gigs.id, Some(summer.id)).is_err());
+    library.rename_folder(summer.id, "Summer 2026").unwrap();
+    library.delete_folder(summer.id).unwrap();
+    let folders = library.folders().unwrap();
+    assert_eq!(folders.len(), 1);
+    let opening = library.playlists().unwrap().pop().unwrap();
+    assert_eq!(opening.folder, Some(gigs.id));
+
+    // Tracks can be put in another order.
+    library
+        .add_to_playlist(set.id, &[id("One"), id("Two"), id("Three")])
+        .unwrap();
+    library.move_in_playlist(set.id, id("Three"), 0).unwrap();
+    let in_set = TrackQuery {
+        playlist: Some(set.id),
+        ..Default::default()
+    };
+    let order: Vec<String> = library
+        .tracks(&in_set)
+        .unwrap()
+        .into_iter()
+        .map(|t| t.title)
+        .collect();
+    assert_eq!(order, ["Three", "One", "Two"]);
 }
 
 #[test]

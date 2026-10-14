@@ -1,13 +1,22 @@
-//! Organising the library: automatic groups of tracks, and
-//! tracks whose files have gone missing.
+//! Organising the library: playlist folders and order,
+//! automatic groups, and tracks whose files have gone missing.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{OptionalExtension, params};
 
 use crate::scan::{collect_audio_files, file_stamp, store_track};
 use crate::{Error, Library, Result, SourceKind, Track, TrackQuery};
+
+/// Seconds since 1970, now.
+pub(crate) fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 /// A range of energy levels, for grouping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -92,7 +101,125 @@ pub struct GroupCount {
     pub count: usize,
 }
 
+/// A folder of playlists, which may sit in another folder.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlaylistFolder {
+    pub id: i64,
+    pub name: String,
+    pub parent: Option<i64>,
+}
+
 impl Library {
+    /// Moves a track to another place in a playlist, counting from 0. The
+    /// tracks between shift up or down to make room.
+    pub fn move_in_playlist(&mut self, playlist: i64, track: i64, to: usize) -> Result<()> {
+        let transaction = self.conn.transaction()?;
+        let mut order: Vec<i64> = {
+            let mut statement = transaction.prepare(
+                "SELECT track_id FROM playlist_tracks WHERE playlist_id = ?1 ORDER BY position",
+            )?;
+            let rows = statement.query_map([playlist], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let Some(from) = order.iter().position(|id| *id == track) else {
+            return Ok(());
+        };
+        let moved = order.remove(from);
+        order.insert(to.min(order.len()), moved);
+        for (position, id) in order.iter().enumerate() {
+            transaction.execute(
+                "UPDATE playlist_tracks SET position = ?3 WHERE playlist_id = ?1 AND track_id = ?2",
+                params![playlist, id, position as i64 + 1],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn create_folder(&self, name: &str, parent: Option<i64>) -> Result<PlaylistFolder> {
+        self.conn.execute(
+            "INSERT INTO playlist_folders (name, parent_id, created_at) VALUES (?1, ?2, ?3)",
+            params![name, parent, now()],
+        )?;
+        Ok(PlaylistFolder {
+            id: self.conn.last_insert_rowid(),
+            name: name.to_string(),
+            parent,
+        })
+    }
+
+    /// All playlist folders, oldest first.
+    pub fn folders(&self) -> Result<Vec<PlaylistFolder>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT id, name, parent_id FROM playlist_folders ORDER BY created_at, id")?;
+        let folders = statement.query_map([], |row| {
+            Ok(PlaylistFolder {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                parent: row.get(2)?,
+            })
+        })?;
+        Ok(folders.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn rename_folder(&self, id: i64, name: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE playlist_folders SET name = ?2 WHERE id = ?1",
+            params![id, name],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes a folder. What was in it moves up to the folder it was in, so
+    /// no playlist is lost.
+    pub fn delete_folder(&mut self, id: i64) -> Result<()> {
+        let transaction = self.conn.transaction()?;
+        let parent: Option<i64> = transaction.query_row(
+            "SELECT parent_id FROM playlist_folders WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "UPDATE playlists SET folder_id = ?2 WHERE folder_id = ?1",
+            params![id, parent],
+        )?;
+        transaction.execute(
+            "UPDATE playlist_folders SET parent_id = ?2 WHERE parent_id = ?1",
+            params![id, parent],
+        )?;
+        transaction.execute("DELETE FROM playlist_folders WHERE id = ?1", [id])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Puts a playlist in a folder, or at the top level with `None`.
+    pub fn move_playlist(&self, playlist: i64, folder: Option<i64>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE playlists SET folder_id = ?2 WHERE id = ?1",
+            params![playlist, folder],
+        )?;
+        Ok(())
+    }
+
+    /// Puts a folder in another, or at the top level with `None`. A folder
+    /// cannot go inside itself or one of its own subfolders.
+    pub fn move_folder(&self, folder: i64, parent: Option<i64>) -> Result<()> {
+        let folders = self.folders()?;
+        let mut at = parent;
+        while let Some(id) = at {
+            if id == folder {
+                return Err(Error::Library("a folder cannot go inside itself".into()));
+            }
+            at = folders.iter().find(|f| f.id == id).and_then(|f| f.parent);
+        }
+        self.conn.execute(
+            "UPDATE playlist_folders SET parent_id = ?2 WHERE id = ?1",
+            params![folder, parent],
+        )?;
+        Ok(())
+    }
+
     /// The automatic groups the library's tracks fall into: genres, energy
     /// bands and decades, each with its number of tracks, and the tracks
     /// that are missing. Groups with no tracks are left out.

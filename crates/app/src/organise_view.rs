@@ -1,4 +1,5 @@
-//! Dialogs for organising the library: finding moved files.
+//! Dialogs for organising the library: naming things, and finding moved
+//! files.
 
 use std::path::PathBuf;
 
@@ -7,11 +8,14 @@ use gpui_kit::component::{
     ActiveTheme, Disableable,
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
+    input::{Input, InputEvent, InputState},
 };
 use gpui_kit::*;
 
 /// What one of these dialogs asks the library view to do.
 pub enum OrganiseEvent {
+    /// A name was entered.
+    Named(String),
     /// Point each track at its file in a new place.
     Relocate(Vec<(i64, PathBuf)>),
     Close,
@@ -42,6 +46,60 @@ fn footer<V: EventEmitter<OrganiseEvent>>(
                 .disabled(!ready)
                 .on_click(cx.listener(move |this, _, window, cx| submit(this, window, cx))),
         )
+}
+
+/// Asks for a name, as for a new folder or a rename.
+pub struct NameForm {
+    name: Entity<InputState>,
+    action: SharedString,
+}
+
+impl NameForm {
+    pub fn new(
+        initial: &str,
+        action: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let initial = initial.to_string();
+        let name = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).placeholder("Name");
+            input.set_value(initial, window, cx);
+            input
+        });
+        cx.subscribe_in(&name, window, |this, _, event: &InputEvent, window, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.submit(window, cx);
+            }
+        })
+        .detach();
+        name.update(cx, |input, cx| input.focus(window, cx));
+        Self {
+            name,
+            action: action.into(),
+        }
+    }
+
+    fn submit(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        let name = self.name.read(cx).value().trim().to_string();
+        if !name.is_empty() {
+            cx.emit(OrganiseEvent::Named(name));
+        }
+    }
+}
+
+impl EventEmitter<OrganiseEvent> for NameForm {}
+
+impl Render for NameForm {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let ready = !self.name.read(cx).value().trim().is_empty();
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(Input::new(&self.name))
+            .child(footer("name", self.action.clone(), ready, Self::submit, cx))
+    }
 }
 
 /// Files found for missing tracks, to confirm before relinking.

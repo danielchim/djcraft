@@ -28,12 +28,12 @@ pub use flow::{
     MIN_CLIP_SPEED,
 };
 pub use import::{ImportSummary, ImportedPlaylist, read_playlists};
-pub use organise::{EnergyBand, Group, GroupCount};
+pub use organise::{EnergyBand, Group, GroupCount, PlaylistFolder};
 pub use scan::{Artwork, ScanProgress, ScanSummary, TrackEdit, read_artwork};
 pub use tags::{AlignOptions, ApplySummary, Cleanup, Placement, PlannedChange, TagBatch, TagField};
 pub use watch::FolderWatcher;
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// A measured tempo is shown only when the analysis was at least this sure
 /// of it. Below that (mixes with several tempos, music with no clear beat)
@@ -249,6 +249,8 @@ pub struct Playlist {
     pub id: i64,
     pub name: String,
     pub track_count: usize,
+    /// The folder it is in; `None` at the top level.
+    pub folder: Option<i64>,
 }
 
 /// Which tracks to list.
@@ -508,6 +510,22 @@ impl Library {
                  COMMIT;",
             )?;
         }
+        if version < 14 {
+            // Folders of playlists, which may sit in other folders.
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE playlist_folders (
+                     id INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL,
+                     parent_id INTEGER REFERENCES playlist_folders (id) ON DELETE CASCADE,
+                     created_at INTEGER NOT NULL
+                 );
+                 ALTER TABLE playlists ADD COLUMN folder_id INTEGER
+                     REFERENCES playlist_folders (id) ON DELETE SET NULL;
+                 PRAGMA user_version = 14;
+                 COMMIT;",
+            )?;
+        }
         Ok(Self { conn })
     }
 
@@ -727,13 +745,14 @@ impl Library {
             id: self.conn.last_insert_rowid(),
             name: name.to_string(),
             track_count: 0,
+            folder: None,
         })
     }
 
     /// All playlists, oldest first.
     pub fn playlists(&self) -> Result<Vec<Playlist>> {
         let mut statement = self.conn.prepare(
-            "SELECT p.id, p.name, COUNT(pt.track_id)
+            "SELECT p.id, p.name, COUNT(pt.track_id), p.folder_id
              FROM playlists p LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id
              GROUP BY p.id ORDER BY p.created_at, p.id",
         )?;
@@ -742,6 +761,7 @@ impl Library {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 track_count: row.get::<_, i64>(2)? as usize,
+                folder: row.get(3)?,
             })
         })?;
         Ok(playlists.collect::<rusqlite::Result<_>>()?)

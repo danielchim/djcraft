@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::f32::consts::TAU;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,8 +10,8 @@ use djcraft_analysis::TempoRange;
 use djcraft_library::lookup::Provider;
 use djcraft_library::{
     AlignOptions, ApplySummary, Camelot, Cleanup, FolderWatcher, Group, GroupCount, ImportSummary,
-    Library, PlannedChange, Playlist, Source, SourceKind, TempoResult, Track, TrackEdit,
-    TrackQuery, read_artwork, read_playlists,
+    Library, PlannedChange, Playlist, PlaylistFolder, Source, SourceKind, TempoResult, Track,
+    TrackEdit, TrackQuery, read_artwork, read_playlists,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -27,13 +27,16 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::lookup_view::{LookupEvent, LookupField, LookupView};
-use crate::organise_view::{OrganiseEvent, RelocateView};
+use crate::organise_view::{NameForm, OrganiseEvent, RelocateView};
 use crate::tag_tools::{FormEvent, RenameForm, ReplaceForm, ReviewEvent, ReviewView};
 
 /// How often the track list is refreshed while a scan is running.
 const SCAN_REFRESH: Duration = Duration::from_millis(400);
 /// How often it is refreshed while tracks are being analysed.
 const ANALYSIS_REFRESH: Duration = Duration::from_secs(2);
+/// What a menu entry does to the library view.
+type MenuAction = Box<dyn Fn(&mut LibraryView, &mut Window, &mut Context<LibraryView>)>;
+
 /// How often watched folders are asked whether they changed.
 const WATCH_POLL: Duration = Duration::from_secs(1);
 /// How long a folder must be left alone before it is scanned, so that a
@@ -485,6 +488,22 @@ impl TableDelegate for TrackTable {
                 .item(item("Locate file…".into(), LibraryView::locate_file, 0));
         }
         if let Some(playlist) = self.playlist {
+            // Moving rows only makes sense in the playlist's own order.
+            if !self.sorted_by_user() {
+                let last = self.tracks.len() as i64 - 1;
+                let at = row_ix as i64;
+                menu = menu.separator();
+                if at > 0 {
+                    menu = menu
+                        .item(item("Move to top".into(), LibraryView::move_track, 0))
+                        .item(item("Move up".into(), LibraryView::move_track, at - 1));
+                }
+                if at < last {
+                    menu = menu
+                        .item(item("Move down".into(), LibraryView::move_track, at + 1))
+                        .item(item("Move to bottom".into(), LibraryView::move_track, last));
+                }
+            }
             menu = menu.separator().item(item(
                 "Remove from playlist".into(),
                 LibraryView::remove_from_playlist,
@@ -639,6 +658,9 @@ pub struct LibraryView {
     /// The automatic group shown, in place of a source.
     group: Option<Group>,
     groups: Vec<GroupCount>,
+    folders: Vec<PlaylistFolder>,
+    /// Playlist folders shown closed.
+    collapsed: HashSet<i64>,
     /// The key picked on the Camelot wheel.
     wheel_key: Option<Camelot>,
     key_counts: HashMap<Camelot, usize>,
@@ -745,6 +767,8 @@ impl LibraryView {
             reanalyse: false,
             group: None,
             groups: Vec::new(),
+            folders: Vec::new(),
+            collapsed: HashSet::new(),
             flow: (!compact).then(|| cx.new(|cx| crate::flow_view::FlowView::new(window, cx))),
             wheel_key: None,
             key_counts: HashMap::new(),
@@ -954,6 +978,7 @@ impl LibraryView {
             self.key_counts = library.key_counts()?;
             if !self.compact {
                 self.groups = library.groups()?;
+                self.folders = library.folders()?;
             }
             Ok::<_, djcraft_library::Error>((library.sources()?, library.playlists()?, tracks))
         })();
@@ -1688,6 +1713,33 @@ impl LibraryView {
         self.reload(cx);
     }
 
+    /// Opens a small dialog that asks for a name, then calls `done` with it.
+    fn ask_name(
+        &mut self,
+        title: &'static str,
+        initial: &str,
+        action: &'static str,
+        done: impl Fn(&mut Self, String, &mut Context<Self>) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let form = cx.new(|cx| NameForm::new(initial, action, window, cx));
+        cx.subscribe_in(
+            &form,
+            window,
+            move |this, _, event: &OrganiseEvent, window, cx| {
+                if let OrganiseEvent::Named(name) = event {
+                    done(this, name.clone(), cx);
+                }
+                window.close_dialog(cx);
+            },
+        )
+        .detach();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog.title(title).w(px(420.)).child(form.clone())
+        });
+    }
+
     /// Runs a change to the library, showing any error, then reloads.
     fn change_library(
         &mut self,
@@ -1844,6 +1896,17 @@ impl LibraryView {
                         ),
                 )
         });
+    }
+
+    /// Moves a track within the open playlist, to `to`.
+    fn move_track(&mut self, track: i64, to: i64, cx: &mut Context<Self>) {
+        let Some(playlist) = self.playlist else {
+            return;
+        };
+        self.change_library(
+            |library| library.move_in_playlist(playlist, track, to.max(0) as usize),
+            cx,
+        );
     }
 
     fn open_playlist(&mut self, playlist: i64, cx: &mut Context<Self>) {
@@ -2323,29 +2386,134 @@ impl LibraryView {
     }
 
     fn playlist_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let (hover, muted) = (theme.secondary, theme.muted_foreground);
+        let mut rows = Vec::new();
+        self.playlist_rows(None, 0, &mut rows, cx);
         div()
             .flex()
             .flex_col()
-            .w(px(220.))
+            .w(px(240.))
             .gap_1()
             .p_2()
             .border_1()
-            .border_color(theme.border)
+            .border_color(cx.theme().border)
             .rounded_lg()
-            .children(self.playlists.iter().map(|playlist| {
-                let id = playlist.id;
+            .child(
+                div()
+                    .id("playlist-tree")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .children(rows),
+            )
+            .child(
+                Button::new("new-playlist")
+                    .outline()
+                    .icon(IconName::Plus)
+                    .label("New playlist")
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.new_playlist_dialog(window, cx)),
+                    ),
+            )
+            .child(
+                Button::new("new-folder")
+                    .outline()
+                    .icon(IconName::FolderPlus)
+                    .label("New folder")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.ask_name(
+                            "New folder",
+                            "",
+                            "Create",
+                            |this, name, cx| {
+                                this.change_library(
+                                    |library| library.create_folder(&name, None).map(|_| ()),
+                                    cx,
+                                )
+                            },
+                            window,
+                            cx,
+                        )
+                    })),
+            )
+            .child(
+                Button::new("import-playlists")
+                    .outline()
+                    .icon(IconName::Download)
+                    .label("Import playlists")
+                    .tooltip("From a rekordbox XML export, a VirtualDJ folder or M3U files")
+                    .on_click(cx.listener(|this, _, _, cx| this.import_playlists(cx))),
+            )
+            .child(self.export_button(cx))
+    }
+
+    /// The folders and playlists in `folder` (the top level for `None`),
+    /// indented by `depth`, with open folders' contents below them.
+    fn playlist_rows(
+        &self,
+        folder: Option<i64>,
+        depth: usize,
+        rows: &mut Vec<AnyElement>,
+        cx: &mut Context<Self>,
+    ) {
+        let theme = cx.theme();
+        let (hover, muted) = (theme.secondary, theme.muted_foreground);
+        let indent = px(8. + depth as f32 * 14.);
+        for sub in self.folders.iter().filter(|f| f.parent == folder) {
+            let id = sub.id;
+            let open = !self.collapsed.contains(&id);
+            rows.push(
+                div()
+                    .id(("folder", id as usize))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(30.))
+                    .pl(indent)
+                    .pr_1()
+                    .rounded_md()
+                    .text_sm()
+                    .hover(|style| style.bg(hover))
+                    .child(
+                        Icon::new(if open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .xsmall()
+                        .text_color(muted),
+                    )
+                    .child(Icon::new(IconName::Folder).small().text_color(muted))
+                    .child(div().flex_1().min_w_0().truncate().child(sub.name.clone()))
+                    .child(self.folder_menu(sub, cx))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.collapsed.remove(&id) {
+                            this.collapsed.insert(id);
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+            if open {
+                self.playlist_rows(Some(id), depth + 1, rows, cx);
+            }
+        }
+        for playlist in self.playlists.iter().filter(|p| p.folder == folder) {
+            let id = playlist.id;
+            let theme = cx.theme();
+            rows.push(
                 div()
                     .id(("playlist", id as usize))
                     .flex()
                     .items_center()
                     .gap_2()
-                    .h(px(32.))
-                    .px_2()
+                    .h(px(30.))
+                    .pl(indent)
+                    .pr_1()
                     .rounded_md()
                     .text_sm()
-                    .when(self.playlist == Some(id), |this| this.bg(hover))
+                    .when(self.playlist == Some(id), |this| this.bg(theme.secondary))
                     .hover(|style| style.bg(hover))
                     .child(Icon::new(IconName::ListMusic).small().text_color(muted))
                     .child(
@@ -2357,44 +2525,176 @@ impl LibraryView {
                     )
                     .child(
                         div()
+                            .text_xs()
                             .text_color(muted)
                             .child(playlist.track_count.to_string()),
                     )
+                    .child(self.playlist_menu(playlist, cx))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.playlist = Some(id);
                         this.reload(cx);
                     }))
-                    .child(
-                        Button::new(("delete-playlist", id as usize))
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Minus)
-                            .tooltip("Delete playlist (tracks stay in the library)")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.delete_playlist(id, cx);
-                            })),
-                    )
-            }))
-            .child(div().flex_1())
-            .child(
-                Button::new("import-playlists")
-                    .outline()
-                    .icon(IconName::Download)
-                    .label("Import playlists")
-                    .tooltip("From a rekordbox XML export, a VirtualDJ folder or M3U files")
-                    .on_click(cx.listener(|this, _, _, cx| this.import_playlists(cx))),
+                    .into_any_element(),
+            );
+        }
+    }
+
+    /// Menu entries that move something into each folder (or the top level),
+    /// leaving out `except` and its subfolders.
+    fn folder_choices(&self, except: Option<i64>) -> Vec<(Option<i64>, String)> {
+        let inside = |mut at: Option<i64>| {
+            while let Some(id) = at {
+                if Some(id) == except {
+                    return true;
+                }
+                at = self
+                    .folders
+                    .iter()
+                    .find(|f| f.id == id)
+                    .and_then(|f| f.parent);
+            }
+            false
+        };
+        std::iter::once((None, "Top level".to_string()))
+            .chain(
+                self.folders
+                    .iter()
+                    .filter(|f| !inside(Some(f.id)))
+                    .map(|f| (Some(f.id), f.name.clone())),
             )
-            .child(self.export_button(cx))
-            .child(
-                Button::new("new-playlist")
-                    .outline()
-                    .icon(IconName::Plus)
-                    .label("New playlist")
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.new_playlist_dialog(window, cx)),
-                    ),
-            )
+            .collect()
+    }
+
+    fn playlist_menu(&self, playlist: &Playlist, cx: &mut Context<Self>) -> impl IntoElement {
+        let (id, name) = (playlist.id, playlist.name.clone());
+        let view = cx.weak_entity();
+        let folders = self.folder_choices(None);
+        let current = playlist.folder;
+        Button::new(("playlist-menu", id as usize))
+            .ghost()
+            .xsmall()
+            .icon(IconName::Ellipsis)
+            .dropdown_menu(move |mut menu, _, _| {
+                let act = |label: &str, run: MenuAction| {
+                    let view = view.clone();
+                    PopupMenuItem::new(label.to_string()).on_click(move |_, window, cx| {
+                        view.update(cx, |view, cx| run(view, window, cx)).ok();
+                    })
+                };
+                let name = name.clone();
+                menu = menu.item(act(
+                    "Rename…",
+                    Box::new(move |this, window, cx| {
+                        this.ask_name(
+                            "Rename playlist",
+                            &name,
+                            "Rename",
+                            move |this, name, cx| {
+                                this.change_library(
+                                    |library| library.rename_playlist(id, &name),
+                                    cx,
+                                )
+                            },
+                            window,
+                            cx,
+                        )
+                    }),
+                ));
+                menu = menu.separator().label("Move to");
+                for (folder, label) in folders.clone() {
+                    menu = menu.item(
+                        act(
+                            &label,
+                            Box::new(move |this, _, cx| {
+                                this.change_library(|library| library.move_playlist(id, folder), cx)
+                            }),
+                        )
+                        .checked(folder == current),
+                    );
+                }
+                menu.separator().item(act(
+                    "Delete playlist",
+                    Box::new(move |this, _, cx| this.delete_playlist(id, cx)),
+                ))
+            })
+    }
+
+    fn folder_menu(&self, folder: &PlaylistFolder, cx: &mut Context<Self>) -> impl IntoElement {
+        let (id, name, current) = (folder.id, folder.name.clone(), folder.parent);
+        let view = cx.weak_entity();
+        let folders = self.folder_choices(Some(id));
+        Button::new(("folder-menu", id as usize))
+            .ghost()
+            .xsmall()
+            .icon(IconName::Ellipsis)
+            .dropdown_menu(move |mut menu, _, _| {
+                let act = |label: &str, run: MenuAction| {
+                    let view = view.clone();
+                    PopupMenuItem::new(label.to_string()).on_click(move |_, window, cx| {
+                        view.update(cx, |view, cx| run(view, window, cx)).ok();
+                    })
+                };
+                let name = name.clone();
+                menu = menu
+                    .item(act(
+                        "New folder inside…",
+                        Box::new(move |this, window, cx| {
+                            this.ask_name(
+                                "New folder",
+                                "",
+                                "Create",
+                                move |this, name, cx| {
+                                    this.collapsed.remove(&id);
+                                    this.change_library(
+                                        |library| {
+                                            library.create_folder(&name, Some(id)).map(|_| ())
+                                        },
+                                        cx,
+                                    )
+                                },
+                                window,
+                                cx,
+                            )
+                        }),
+                    ))
+                    .item(act(
+                        "Rename…",
+                        Box::new(move |this, window, cx| {
+                            this.ask_name(
+                                "Rename folder",
+                                &name,
+                                "Rename",
+                                move |this, name, cx| {
+                                    this.change_library(
+                                        |library| library.rename_folder(id, &name),
+                                        cx,
+                                    )
+                                },
+                                window,
+                                cx,
+                            )
+                        }),
+                    ))
+                    .separator()
+                    .label("Move to");
+                for (parent, label) in folders.clone() {
+                    menu = menu.item(
+                        act(
+                            &label,
+                            Box::new(move |this, _, cx| {
+                                this.change_library(|library| library.move_folder(id, parent), cx)
+                            }),
+                        )
+                        .checked(parent == current),
+                    );
+                }
+                menu.separator().item(act(
+                    "Delete folder (keeps its playlists)",
+                    Box::new(move |this, _, cx| {
+                        this.change_library(|library| library.delete_folder(id), cx)
+                    }),
+                ))
+            })
     }
 
     /// Asks for a name and creates a playlist with it.
