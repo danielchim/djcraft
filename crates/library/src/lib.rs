@@ -28,12 +28,14 @@ pub use flow::{
     MIN_CLIP_SPEED,
 };
 pub use import::{ImportSummary, ImportedPlaylist, read_playlists};
-pub use organise::{EnergyBand, Group, GroupCount, PlaylistFolder};
+pub use organise::{
+    EnergyBand, Group, GroupCount, PlaylistFolder, Rule, SmartRules, TextField, TextOp,
+};
 pub use scan::{Artwork, ScanProgress, ScanSummary, TrackEdit, read_artwork};
 pub use tags::{AlignOptions, ApplySummary, Cleanup, Placement, PlannedChange, TagBatch, TagField};
 pub use watch::FolderWatcher;
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 /// A measured tempo is shown only when the analysis was at least this sure
 /// of it. Below that (mixes with several tempos, music with no clear beat)
@@ -251,6 +253,8 @@ pub struct Playlist {
     pub track_count: usize,
     /// The folder it is in; `None` at the top level.
     pub folder: Option<i64>,
+    /// For a smart playlist, the rules that choose its tracks.
+    pub rules: Option<SmartRules>,
 }
 
 /// Which tracks to list.
@@ -526,6 +530,15 @@ impl Library {
                  COMMIT;",
             )?;
         }
+        if version < 15 {
+            // The rules of a smart playlist, which chooses its own tracks.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE playlists ADD COLUMN rules TEXT;
+                 PRAGMA user_version = 15;
+                 COMMIT;",
+            )?;
+        }
         Ok(Self { conn })
     }
 
@@ -746,25 +759,52 @@ impl Library {
             name: name.to_string(),
             track_count: 0,
             folder: None,
+            rules: None,
         })
     }
 
-    /// All playlists, oldest first.
+    /// All playlists, oldest first. A smart playlist's count is of the
+    /// tracks its rules choose now.
     pub fn playlists(&self) -> Result<Vec<Playlist>> {
         let mut statement = self.conn.prepare(
-            "SELECT p.id, p.name, COUNT(pt.track_id), p.folder_id
+            "SELECT p.id, p.name, COUNT(pt.track_id), p.folder_id, p.rules
              FROM playlists p LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id
              GROUP BY p.id ORDER BY p.created_at, p.id",
         )?;
         let playlists = statement.query_map([], |row| {
-            Ok(Playlist {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                track_count: row.get::<_, i64>(2)? as usize,
-                folder: row.get(3)?,
-            })
+            Ok((
+                Playlist {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    track_count: row.get::<_, i64>(2)? as usize,
+                    folder: row.get(3)?,
+                    rules: None,
+                },
+                row.get::<_, Option<String>>(4)?,
+            ))
         })?;
-        Ok(playlists.collect::<rusqlite::Result<_>>()?)
+        let mut playlists: Vec<(Playlist, Option<String>)> =
+            playlists.collect::<rusqlite::Result<_>>()?;
+        let mut everything: Option<Vec<Track>> = None;
+        for (playlist, rules) in &mut playlists {
+            let Some(rules) = rules.as_deref().and_then(SmartRules::from_json) else {
+                continue;
+            };
+            if everything.is_none() {
+                everything = Some(self.tracks(&TrackQuery::default())?);
+            }
+            let now = organise::now();
+            playlist.track_count = everything
+                .iter()
+                .flatten()
+                .filter(|track| rules.matches(track, now))
+                .count();
+            playlist.rules = Some(rules);
+        }
+        Ok(playlists
+            .into_iter()
+            .map(|(playlist, _)| playlist)
+            .collect())
     }
 
     pub fn rename_playlist(&self, id: i64, name: &str) -> Result<()> {
@@ -783,8 +823,13 @@ impl Library {
     }
 
     /// Appends tracks to a playlist, skipping any it already contains.
-    /// Returns how many were added.
+    /// Returns how many were added. A smart playlist chooses its own tracks.
     pub fn add_to_playlist(&mut self, playlist: i64, tracks: &[i64]) -> Result<usize> {
+        if self.playlist_rules(playlist)?.is_some() {
+            return Err(Error::Library(
+                "a smart playlist chooses its own tracks from its rules".into(),
+            ));
+        }
         let transaction = self.conn.transaction()?;
         let mut position: i64 = transaction.query_row(
             "SELECT COALESCE(MAX(position), 0) FROM playlist_tracks WHERE playlist_id = ?1",
@@ -861,6 +906,19 @@ impl Library {
     /// Lists tracks, ordered by artist and then title, or in playlist order
     /// when the query names a playlist.
     pub fn tracks(&self, query: &TrackQuery) -> Result<Vec<Track>> {
+        // A smart playlist is the library, filtered by its rules.
+        if let Some(playlist) = query.playlist
+            && let Some(rules) = self.playlist_rules(playlist)?
+        {
+            let all = TrackQuery {
+                playlist: None,
+                ..query.clone()
+            };
+            let now = organise::now();
+            let mut tracks = self.tracks(&all)?;
+            tracks.retain(|track| rules.matches(track, now));
+            return Ok(tracks);
+        }
         let mut sql = format!(
             "SELECT t.id, t.source_id, s.location, t.locator, t.title, t.artist, t.album,
                     t.genre, t.duration, {bpm}, {key}, t.energy, s.name, s.kind,

@@ -2,8 +2,9 @@ use std::path::{Path, PathBuf};
 
 use djcraft_library::{
     AlignOptions, Camelot, Cleanup, ClipPlacement, CuePoint, EnergyBand, FolderWatcher, Group,
-    ImportSummary, KeepTagged, KeyResult, Library, Placement, ScanSummary, SourceKind, TagField,
-    TempoResult, TrackEdit, TrackQuery, read_artwork, read_playlists,
+    ImportSummary, KeepTagged, KeyResult, Library, Placement, Rule, ScanSummary, SmartRules,
+    SourceKind, TagField, TempoResult, TextField, TextOp, TrackEdit, TrackQuery, read_artwork,
+    read_playlists,
 };
 use lofty::config::WriteOptions;
 use lofty::tag::{Accessor, ItemKey, Tag, TagExt, TagType};
@@ -400,6 +401,7 @@ fn an_existing_library_gains_playlists_on_upgrade() {
     raw.execute_batch(
         "ALTER TABLE playlists DROP COLUMN folder_id;
          DROP TABLE playlist_folders;
+         ALTER TABLE playlists DROP COLUMN rules;
          ALTER TABLE tracks DROP COLUMN year;
          ALTER TABLE tracks DROP COLUMN year_checked;
          ALTER TABLE tracks DROP COLUMN missing;
@@ -1306,6 +1308,72 @@ fn playlists_have_folders_and_order() {
         .map(|t| t.title)
         .collect();
     assert_eq!(order, ["Three", "One", "Two"]);
+}
+
+#[test]
+fn smart_playlists_choose_their_own_tracks() {
+    let dir = TempDir::new("smart");
+    write_tagged(&dir.0.join("a.wav"), "One", "A", "Tech House", "124", "8A");
+    write_tagged(&dir.0.join("b.wav"), "Two", "B", "tech house", "126", "9A");
+    write_tagged(&dir.0.join("c.wav"), "Three", "C", "Disco", "110", "3B");
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let all = library.tracks(&TrackQuery::default()).unwrap();
+    let id = |title: &str| all.iter().find(|t| t.title == title).unwrap().id;
+    // A smart playlist holds what its rules choose, and takes no tracks by hand.
+    let rules = SmartRules {
+        match_all: true,
+        rules: vec![
+            Rule::Text {
+                field: TextField::Genre,
+                op: TextOp::Is,
+                value: "Tech House".into(),
+            },
+            Rule::Key {
+                key: Camelot::parse("8A").unwrap(),
+                compatible: true,
+            },
+        ],
+    };
+    let smart = library.create_smart_playlist("Warm-up", &rules).unwrap();
+    let chosen = TrackQuery {
+        playlist: Some(smart.id),
+        ..Default::default()
+    };
+    let titles_in = |library: &Library| -> Vec<String> {
+        library
+            .tracks(&chosen)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.title)
+            .collect()
+    };
+    assert_eq!(titles_in(&library), ["One", "Two"]);
+    let listed = library
+        .playlists()
+        .unwrap()
+        .into_iter()
+        .find(|p| p.id == smart.id)
+        .unwrap();
+    assert_eq!((listed.track_count, listed.rules), (2, Some(rules.clone())));
+    assert!(library.add_to_playlist(smart.id, &[id("Three")]).is_err());
+    let any = SmartRules {
+        match_all: false,
+        rules: vec![
+            Rule::Bpm {
+                min: 100.0,
+                max: 115.0,
+            },
+            Rule::Text {
+                field: TextField::Title,
+                op: TextOp::StartsWith,
+                value: "on".into(),
+            },
+        ],
+    };
+    library.set_playlist_rules(smart.id, &any).unwrap();
+    assert_eq!(titles_in(&library), ["One", "Three"]);
 }
 
 #[test]

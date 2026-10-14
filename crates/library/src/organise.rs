@@ -1,4 +1,4 @@
-//! Organising the library: playlist folders and order,
+//! Organising the library: playlist folders and order, smart playlists,
 //! automatic groups, and tracks whose files have gone missing.
 
 use std::collections::{HashMap, HashSet};
@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 
 use crate::scan::{collect_audio_files, file_stamp, store_track};
-use crate::{Error, Library, Result, SourceKind, Track, TrackQuery};
+use crate::{Camelot, Error, Library, Playlist, Result, SourceKind, Track, TrackQuery};
 
 /// Seconds since 1970, now.
 pub(crate) fn now() -> i64 {
@@ -16,6 +17,145 @@ pub(crate) fn now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// What a smart playlist holds: every track that passes all of its rules,
+/// or any one of them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SmartRules {
+    pub match_all: bool,
+    pub rules: Vec<Rule>,
+}
+
+/// One test a track must pass to be in a smart playlist.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "rule", rename_all = "snake_case")]
+pub enum Rule {
+    Text {
+        field: TextField,
+        op: TextOp,
+        value: String,
+    },
+    /// Tempo from `min` to `max`, both included.
+    Bpm { min: f64, max: f64 },
+    /// Energy from `min` to `max`, both included.
+    Energy { min: u8, max: u8 },
+    /// Year from `min` to `max`, both included.
+    Year { min: i32, max: i32 },
+    /// In this key or, with `compatible`, in any key that mixes with it.
+    Key { key: Camelot, compatible: bool },
+    /// Joined the library in the last so many days.
+    AddedWithinDays { days: u32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextField {
+    Title,
+    Artist,
+    Album,
+    Genre,
+}
+
+impl TextField {
+    pub const ALL: [TextField; 4] = [
+        TextField::Title,
+        TextField::Artist,
+        TextField::Album,
+        TextField::Genre,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TextField::Title => "Title",
+            TextField::Artist => "Artist",
+            TextField::Album => "Album",
+            TextField::Genre => "Genre",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextOp {
+    Contains,
+    DoesNotContain,
+    Is,
+    StartsWith,
+}
+
+impl TextOp {
+    pub const ALL: [TextOp; 4] = [
+        TextOp::Contains,
+        TextOp::DoesNotContain,
+        TextOp::Is,
+        TextOp::StartsWith,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TextOp::Contains => "contains",
+            TextOp::DoesNotContain => "does not contain",
+            TextOp::Is => "is",
+            TextOp::StartsWith => "starts with",
+        }
+    }
+}
+
+impl SmartRules {
+    pub(crate) fn from_json(text: &str) -> Option<SmartRules> {
+        serde_json::from_str(text).ok()
+    }
+
+    /// Whether a track belongs. No rules at all matches nothing, so a new,
+    /// empty smart playlist is not the whole library.
+    pub fn matches(&self, track: &Track, now: i64) -> bool {
+        if self.rules.is_empty() {
+            return false;
+        }
+        let mut results = self.rules.iter().map(|rule| rule.matches(track, now));
+        if self.match_all {
+            results.all(|passed| passed)
+        } else {
+            results.any(|passed| passed)
+        }
+    }
+}
+
+impl Rule {
+    fn matches(&self, track: &Track, now: i64) -> bool {
+        match self {
+            Rule::Text { field, op, value } => {
+                let text = match field {
+                    TextField::Title => &track.title,
+                    TextField::Artist => &track.artist,
+                    TextField::Album => &track.album,
+                    TextField::Genre => &track.genre,
+                }
+                .to_lowercase();
+                let value = value.trim().to_lowercase();
+                match op {
+                    TextOp::Contains => text.contains(&value),
+                    TextOp::DoesNotContain => !text.contains(&value),
+                    TextOp::Is => text.trim() == value,
+                    TextOp::StartsWith => text.starts_with(&value),
+                }
+            }
+            Rule::Bpm { min, max } => track.bpm.is_some_and(|bpm| bpm >= *min && bpm <= *max),
+            Rule::Energy { min, max } => track
+                .energy
+                .is_some_and(|energy| energy >= *min && energy <= *max),
+            Rule::Year { min, max } => track.year.is_some_and(|year| year >= *min && year <= *max),
+            Rule::Key { key, compatible } => track.camelot.is_some_and(|camelot| {
+                if *compatible {
+                    key.compatible().contains(&camelot)
+                } else {
+                    camelot == *key
+                }
+            }),
+            Rule::AddedWithinDays { days } => now - track.added_at <= *days as i64 * 86_400,
+        }
+    }
 }
 
 /// A range of energy levels, for grouping.
@@ -110,6 +250,36 @@ pub struct PlaylistFolder {
 }
 
 impl Library {
+    /// The rules of a smart playlist; `None` for an ordinary one.
+    pub fn playlist_rules(&self, playlist: i64) -> Result<Option<SmartRules>> {
+        let rules: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT rules FROM playlists WHERE id = ?1",
+                [playlist],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(rules.flatten().as_deref().and_then(SmartRules::from_json))
+    }
+
+    pub fn create_smart_playlist(&self, name: &str, rules: &SmartRules) -> Result<Playlist> {
+        let mut playlist = self.create_playlist(name)?;
+        self.set_playlist_rules(playlist.id, rules)?;
+        playlist.rules = Some(rules.clone());
+        Ok(playlist)
+    }
+
+    /// Changes a smart playlist's rules.
+    pub fn set_playlist_rules(&self, playlist: i64, rules: &SmartRules) -> Result<()> {
+        let json = serde_json::to_string(rules).map_err(|e| Error::Library(e.to_string()))?;
+        self.conn.execute(
+            "UPDATE playlists SET rules = ?2 WHERE id = ?1",
+            params![playlist, json],
+        )?;
+        Ok(())
+    }
+
     /// Moves a track to another place in a playlist, counting from 0. The
     /// tracks between shift up or down to make room.
     pub fn move_in_playlist(&mut self, playlist: i64, track: i64, to: usize) -> Result<()> {
@@ -396,5 +566,82 @@ impl Library {
         Ok(self
             .conn
             .execute("DELETE FROM tracks WHERE missing = 1", [])?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track(title: &str, artist: &str, bpm: f64, key: &str, energy: u8) -> Track {
+        Track {
+            id: 0,
+            source_id: 1,
+            source_name: String::new(),
+            source_kind: SourceKind::Folder,
+            path: PathBuf::new(),
+            title: title.into(),
+            artist: artist.into(),
+            album: String::new(),
+            genre: "Tech House".into(),
+            duration_seconds: 300.0,
+            bpm: Some(bpm),
+            key: Some(key.into()),
+            camelot: Camelot::parse(key),
+            energy: Some(energy),
+            year: Some(2019),
+            missing: false,
+            added_at: 1_000_000,
+        }
+    }
+
+    #[test]
+    fn smart_rules_match_all_or_any() {
+        let track = track("Losing It", "Fisher", 125.0, "8A", 7);
+        let rules = |match_all: bool, rules: Vec<Rule>| SmartRules { match_all, rules };
+        let fast = Rule::Bpm {
+            min: 124.0,
+            max: 128.0,
+        };
+        let slow = Rule::Bpm {
+            min: 90.0,
+            max: 110.0,
+        };
+        let fisher = Rule::Text {
+            field: TextField::Artist,
+            op: TextOp::Is,
+            value: "fisher".into(),
+        };
+        let now = 1_000_000 + 3 * 86_400;
+        assert!(rules(true, vec![fast.clone(), fisher.clone()]).matches(&track, now));
+        assert!(!rules(true, vec![slow.clone(), fisher.clone()]).matches(&track, now));
+        assert!(rules(false, vec![slow, fisher]).matches(&track, now));
+        assert!(!rules(true, vec![]).matches(&track, now));
+
+        let mixes = Rule::Key {
+            key: Camelot::parse("9A").unwrap(),
+            compatible: true,
+        };
+        assert!(rules(true, vec![mixes]).matches(&track, now));
+        let recent = |days| Rule::AddedWithinDays { days };
+        assert!(rules(true, vec![recent(7)]).matches(&track, now));
+        assert!(!rules(true, vec![recent(2)]).matches(&track, now));
+        let decade = Rule::Year {
+            min: 2010,
+            max: 2019,
+        };
+        let energetic = Rule::Energy { min: 7, max: 10 };
+        let not_house = Rule::Text {
+            field: TextField::Genre,
+            op: TextOp::DoesNotContain,
+            value: "house".into(),
+        };
+        assert!(rules(true, vec![decade, energetic.clone()]).matches(&track, now));
+        assert!(!rules(true, vec![energetic, not_house]).matches(&track, now));
+
+        // Rules keep their meaning through storage.
+        let stored = rules(false, vec![fast, recent(30)]);
+        let json = serde_json::to_string(&stored).unwrap();
+        assert_eq!(SmartRules::from_json(&json), Some(stored));
     }
 }

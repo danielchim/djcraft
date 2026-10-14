@@ -27,7 +27,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::lookup_view::{LookupEvent, LookupField, LookupView};
-use crate::organise_view::{NameForm, OrganiseEvent, RelocateView};
+use crate::organise_view::{NameForm, OrganiseEvent, RelocateView, SmartForm};
 use crate::tag_tools::{FormEvent, RenameForm, ReplaceForm, ReviewEvent, ReviewView};
 
 /// How often the track list is refreshed while a scan is running.
@@ -338,6 +338,8 @@ struct TrackTable {
     playlists: Vec<Playlist>,
     /// The playlist being shown, if any.
     playlist: Option<i64>,
+    /// Whether it is a smart playlist, whose order cannot be changed.
+    smart: bool,
     /// The columns shown, as places in [`COLUMNS`].
     visible: Vec<usize>,
 }
@@ -350,6 +352,7 @@ impl TrackTable {
             sort: None,
             playlists: Vec::new(),
             playlist: None,
+            smart: false,
             visible: (0..COLUMNS.len()).collect(),
         }
     }
@@ -487,7 +490,7 @@ impl TableDelegate for TrackTable {
                 .separator()
                 .item(item("Locate file…".into(), LibraryView::locate_file, 0));
         }
-        if let Some(playlist) = self.playlist {
+        if let Some(playlist) = self.playlist.filter(|_| !self.smart) {
             // Moving rows only makes sense in the playlist's own order.
             if !self.sorted_by_user() {
                 let last = self.tracks.len() as i64 - 1;
@@ -510,10 +513,11 @@ impl TableDelegate for TrackTable {
                 playlist,
             ));
         }
+        // A smart playlist fills itself, so tracks cannot be added by hand.
         let others: Vec<_> = self
             .playlists
             .iter()
-            .filter(|playlist| Some(playlist.id) != self.playlist)
+            .filter(|playlist| Some(playlist.id) != self.playlist && playlist.rules.is_none())
             .collect();
         if !others.is_empty() {
             menu = menu.separator().label("Add to playlist");
@@ -986,8 +990,13 @@ impl LibraryView {
             Ok((sources, playlists, tracks)) => {
                 self.sources = sources;
                 self.playlists = playlists.clone();
+                let smart = query
+                    .playlist
+                    .and_then(|id| playlists.iter().find(|p| p.id == id))
+                    .is_some_and(|playlist| playlist.rules.is_some());
                 self.table.update(cx, |table, cx| {
                     let table = table.delegate_mut();
+                    table.smart = smart;
                     table.set_tracks(tracks, playlists, query.playlist);
                     cx.notify();
                 });
@@ -1756,6 +1765,57 @@ impl LibraryView {
         cx.emit(LibraryEvent::Changed);
     }
 
+    /// Opens the smart playlist editor, for a new one or to change one.
+    fn edit_smart(&mut self, playlist: Option<i64>, window: &mut Window, cx: &mut Context<Self>) {
+        let existing = playlist
+            .and_then(|id| self.playlists.iter().find(|p| p.id == id))
+            .cloned();
+        let name = existing
+            .as_ref()
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        let rules = existing.as_ref().and_then(|p| p.rules.clone());
+        let form = cx.new(|cx| SmartForm::new(&name, rules.as_ref(), window, cx));
+        cx.subscribe_in(
+            &form,
+            window,
+            move |this, _, event: &OrganiseEvent, window, cx| {
+                if let OrganiseEvent::Smart(name, rules) = event {
+                    let (name, rules) = (name.clone(), rules.clone());
+                    let mut created = None;
+                    this.change_library(
+                        |library| {
+                            match playlist {
+                                Some(id) => {
+                                    library.rename_playlist(id, &name)?;
+                                    library.set_playlist_rules(id, &rules)?;
+                                }
+                                None => {
+                                    created = Some(library.create_smart_playlist(&name, &rules)?.id)
+                                }
+                            }
+                            Ok(())
+                        },
+                        cx,
+                    );
+                    if let Some(id) = created.or(playlist) {
+                        this.open_playlist(id, cx);
+                    }
+                }
+                window.close_dialog(cx);
+            },
+        )
+        .detach();
+        let title = if playlist.is_some() {
+            "Edit smart playlist"
+        } else {
+            "New smart playlist"
+        };
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog.title(title).w(px(680.)).child(form.clone())
+        });
+    }
+
     /// Asks for a folder, looks there for the files of missing tracks, and
     /// offers to relink those it finds.
     fn find_moved(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2417,6 +2477,14 @@ impl LibraryView {
                     ),
             )
             .child(
+                Button::new("new-smart-playlist")
+                    .outline()
+                    .icon(IconName::WandSparkles)
+                    .label("New smart playlist")
+                    .tooltip("A playlist that fills itself from rules, such as genre and tempo")
+                    .on_click(cx.listener(|this, _, window, cx| this.edit_smart(None, window, cx))),
+            )
+            .child(
                 Button::new("new-folder")
                     .outline()
                     .icon(IconName::FolderPlus)
@@ -2515,7 +2583,15 @@ impl LibraryView {
                     .text_sm()
                     .when(self.playlist == Some(id), |this| this.bg(theme.secondary))
                     .hover(|style| style.bg(hover))
-                    .child(Icon::new(IconName::ListMusic).small().text_color(muted))
+                    .child(
+                        Icon::new(if playlist.rules.is_some() {
+                            IconName::WandSparkles
+                        } else {
+                            IconName::ListMusic
+                        })
+                        .small()
+                        .text_color(muted),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -2566,7 +2642,7 @@ impl LibraryView {
     }
 
     fn playlist_menu(&self, playlist: &Playlist, cx: &mut Context<Self>) -> impl IntoElement {
-        let (id, name) = (playlist.id, playlist.name.clone());
+        let (id, name, smart) = (playlist.id, playlist.name.clone(), playlist.rules.is_some());
         let view = cx.weak_entity();
         let folders = self.folder_choices(None);
         let current = playlist.folder;
@@ -2600,6 +2676,12 @@ impl LibraryView {
                         )
                     }),
                 ));
+                if smart {
+                    menu = menu.item(act(
+                        "Edit rules…",
+                        Box::new(move |this, window, cx| this.edit_smart(Some(id), window, cx)),
+                    ));
+                }
                 menu = menu.separator().label("Move to");
                 for (folder, label) in folders.clone() {
                     menu = menu.item(

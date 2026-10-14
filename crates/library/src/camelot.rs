@@ -127,6 +127,20 @@ impl Camelot {
     }
 }
 
+/// Stored as it is written, such as "8A".
+impl serde::Serialize for Camelot {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Camelot {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Camelot::parse(&text).ok_or_else(|| serde::de::Error::custom(format!("not a key: {text}")))
+    }
+}
+
 impl fmt::Display for Camelot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}{}", self.number, if self.major { 'B' } else { 'A' })
