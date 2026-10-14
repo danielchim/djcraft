@@ -29,15 +29,21 @@ pub enum Provider {
     /// Apple's store catalogue. Clean album names and a genre for every
     /// track, but only music that Apple sells.
     Itunes,
+    /// Identifies a track by its sound, whatever its tags say. Needs an
+    /// application key, and is used with [`identify`] rather than
+    /// [`search`].
+    AcoustId,
 }
 
 impl Provider {
+    /// Those that search by artist and title.
     pub const ALL: [Provider; 2] = [Provider::MusicBrainz, Provider::Itunes];
 
     pub fn label(self) -> &'static str {
         match self {
             Provider::MusicBrainz => "MusicBrainz",
             Provider::Itunes => "iTunes Store",
+            Provider::AcoustId => "AcoustID (by sound)",
         }
     }
 }
@@ -61,6 +67,9 @@ pub fn search(provider: Provider, artist: &str, title: &str) -> Result<Vec<Track
     let find = |artist: &str| match provider {
         Provider::MusicBrainz => musicbrainz(artist, &query_title),
         Provider::Itunes => itunes(artist, &query_title),
+        Provider::AcoustId => Err(Error::Lookup(
+            "AcoustID identifies tracks by their sound, not by name.".into(),
+        )),
     };
     let mut found = find(&query_artist)?;
     if found.is_empty() && !query_artist.is_empty() {
@@ -72,6 +81,139 @@ pub fn search(provider: Provider, artist: &str, title: &str) -> Result<Vec<Track
         found = find("")?;
     }
     Ok(rank(found, &wanted_artist, &wanted_title))
+}
+
+/// The credentials some providers need, as the user entered them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Keys {
+    /// An AcoustID application key, from acoustid.org.
+    pub acoustid: String,
+}
+
+/// Identifies a track from its acoustic fingerprint (as made by
+/// `djcraft_analysis::fingerprint`) and its length in seconds. The best
+/// matches come first. Makes one network request.
+pub fn identify(
+    api_key: &str,
+    fingerprint: &str,
+    duration_seconds: u32,
+) -> Result<Vec<TrackMatch>> {
+    if api_key.trim().is_empty() {
+        return Err(Error::Lookup(
+            "AcoustID needs an application key. Add one in Settings, Library.".into(),
+        ));
+    }
+    let body = get(Provider::AcoustId, || {
+        // AcoustID explains a refusal (a bad key, say) in the body of an
+        // error reply, so error replies are read like any other.
+        ureq::get("https://api.acoustid.org/v2/lookup")
+            .config()
+            .timeout_global(Some(Duration::from_secs(15)))
+            .http_status_as_error(false)
+            .build()
+            .query("client", api_key.trim())
+            .query("meta", "recordings releasegroups compress")
+            .query("duration", duration_seconds.to_string())
+            .query("fingerprint", fingerprint)
+    })?;
+    parse_acoustid(&body)
+}
+
+#[derive(Deserialize)]
+struct AcoustIdResponse {
+    status: String,
+    #[serde(default)]
+    error: Option<AcoustIdError>,
+    #[serde(default)]
+    results: Vec<AcoustIdResult>,
+}
+
+#[derive(Deserialize)]
+struct AcoustIdError {
+    #[serde(default)]
+    message: String,
+}
+
+#[derive(Deserialize)]
+struct AcoustIdResult {
+    #[serde(default)]
+    score: f64,
+    #[serde(default)]
+    recordings: Vec<AcoustIdRecording>,
+}
+
+#[derive(Deserialize)]
+struct AcoustIdRecording {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    artists: Vec<ArtistCredit>,
+    #[serde(default)]
+    releasegroups: Vec<AcoustIdGroup>,
+}
+
+#[derive(Deserialize)]
+struct AcoustIdGroup {
+    #[serde(default)]
+    title: String,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    secondarytypes: Vec<String>,
+}
+
+fn parse_acoustid(body: &str) -> Result<Vec<TrackMatch>> {
+    let response: AcoustIdResponse = serde_json::from_str(body)
+        .map_err(|e| Error::Lookup(format!("AcoustID reply was not understood: {e}")))?;
+    if response.status != "ok" {
+        let message = response.error.map(|e| e.message).unwrap_or_default();
+        return Err(Error::Lookup(format!(
+            "AcoustID refused the lookup: {message}"
+        )));
+    }
+    let mut found = Vec::new();
+    for result in response.results {
+        for recording in result.recordings {
+            if recording.title.is_empty() {
+                continue;
+            }
+            // The artist's own album, single or EP, before compilations.
+            let original = |group: &&AcoustIdGroup| {
+                group.secondarytypes.is_empty()
+                    && matches!(group.kind.as_deref(), Some("Album" | "Single" | "EP"))
+            };
+            let group = recording
+                .releasegroups
+                .iter()
+                .find(original)
+                .or(recording.releasegroups.first());
+            found.push(TrackMatch {
+                title: recording.title,
+                artist: recording
+                    .artists
+                    .iter()
+                    .map(|credit| format!("{}{}", credit.name, credit.joinphrase))
+                    .collect(),
+                album: group.map(|group| group.title.clone()).unwrap_or_default(),
+                year: None,
+                genre: None,
+                score: (result.score * 100.0).round().clamp(0.0, 100.0) as u8,
+                compilation: !group.is_some_and(|group| original(&group)),
+                provider: Provider::AcoustId,
+            });
+        }
+    }
+    found.sort_by_key(|candidate| std::cmp::Reverse(candidate.score));
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|candidate| {
+        seen.insert((
+            words(&candidate.title),
+            words(&candidate.artist),
+            words(&candidate.album),
+        ))
+    });
+    found.truncate(MAX_MATCHES);
+    Ok(found)
 }
 
 /// The artist and title to search for, tidied from what a file's tags say:
@@ -183,6 +325,9 @@ fn get(
     let describe = |e: ureq::Error| match e {
         ureq::Error::StatusCode(429 | 503) => {
             format!("{name} is busy. Try again in a few seconds.")
+        }
+        ureq::Error::StatusCode(401 | 403) => {
+            format!("{name} did not accept the key in Settings. Check it and try again.")
         }
         ureq::Error::StatusCode(code) => format!("{name} answered with an error ({code})."),
         ureq::Error::Timeout(_) => format!("{name} did not answer in time."),
@@ -622,6 +767,8 @@ mod tests {
         );
         assert_eq!(terms("Simon & Garfunkel", "Mrs. Robinson").0, "Simon");
         assert!(search(Provider::Itunes, "Someone", " ").is_err());
+        // A provider that needs a key says so before asking anything online.
+        assert!(identify("", "AQAA", 120).is_err());
     }
 
     #[test]
@@ -720,6 +867,40 @@ mod tests {
         assert_eq!(matches[1].artist, "");
         assert_eq!(matches[1].year, None);
         assert!(parse_musicbrainz("<html>busy</html>").is_err());
+    }
+
+    #[test]
+    fn reads_an_acoustid_reply() {
+        let body = r#"{"status":"ok","results":[
+            {"id":"a","score":0.95,"recordings":[
+                {"id":"r1","title":"Losing It","artists":[{"name":"FISHER"}],
+                 "releasegroups":[
+                    {"title":"Hits 2019","type":"Album","secondarytypes":["Compilation"]},
+                    {"title":"Losing It","type":"Single"}]},
+                {"id":"r2","title":"Losing It","artists":[{"name":"FISHER"}],
+                 "releasegroups":[{"title":"Hits 2019","type":"Album","secondarytypes":["Compilation"]}]}]},
+            {"id":"b","score":0.4,"recordings":[{"id":"r3","title":""}]}
+        ]}"#;
+        let found = parse_acoustid(body).unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(
+            (found[0].album.as_str(), found[0].compilation),
+            ("Losing It", false)
+        );
+        assert_eq!(
+            (found[1].album.as_str(), found[1].compilation),
+            ("Hits 2019", true)
+        );
+        assert_eq!(found[0].score, 95);
+        assert_eq!(found[0].provider, Provider::AcoustId);
+
+        let refused = r#"{"status":"error","error":{"code":4,"message":"invalid API key"}}"#;
+        assert!(
+            parse_acoustid(refused)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid API key")
+        );
     }
 
     #[test]

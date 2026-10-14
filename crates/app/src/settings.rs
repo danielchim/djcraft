@@ -114,6 +114,9 @@ pub struct Settings {
     pub key_placement: Placement,
     /// Where Tag tools write a track's energy.
     pub energy_placement: Placement,
+    /// The user's own AcoustID application key, for looking tracks up by
+    /// their sound.
+    pub acoustid_key: String,
 }
 
 impl Global for Settings {}
@@ -174,6 +177,7 @@ impl Default for Settings {
             keep_tagged_key: KeepTagged::default().key,
             key_placement: Placement::KeyField,
             energy_placement: Placement::Comment,
+            acoustid_key: String::new(),
         }
     }
 }
@@ -188,6 +192,13 @@ impl Settings {
         TempoRange {
             min_bpm: self.tempo_min_bpm as f64,
             max_bpm: self.tempo_max_bpm as f64,
+        }
+    }
+
+    /// The keys online lookups use.
+    pub fn lookup_keys(&self) -> djcraft_library::lookup::Keys {
+        djcraft_library::lookup::Keys {
+            acoustid: self.acoustid_key.trim().to_string(),
         }
     }
 
@@ -245,6 +256,7 @@ mod tests {
             keep_tagged_key: false,
             key_placement: Placement::TitlePrefix,
             energy_placement: Placement::Grouping,
+            acoustid_key: "key".into(),
         };
         settings.save(&dir).unwrap();
         assert_eq!(Settings::load(&dir), settings);

@@ -1,6 +1,8 @@
 //! The Look up popup: searches an online database for the track in the info
 //! panel, lists what it finds, and copies the chosen details back.
 
+use std::path::{Path, PathBuf};
+
 use djcraft_library::lookup::{self, Provider, TrackMatch};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -59,6 +61,8 @@ pub struct LookupView {
     artist: Entity<InputState>,
     title: Entity<InputState>,
     provider: Provider,
+    /// The track's file, which AcoustID identifies by its sound.
+    path: PathBuf,
     /// What the info panel holds now, in [`LookupField::ALL`] order.
     current: [String; 4],
     results: Vec<TrackMatch>,
@@ -78,6 +82,7 @@ impl LookupView {
     pub fn new(
         current: [String; 4],
         provider: Provider,
+        path: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -103,6 +108,7 @@ impl LookupView {
             artist,
             title,
             provider,
+            path,
             current,
             results: Vec::new(),
             selected: None,
@@ -119,6 +125,11 @@ impl LookupView {
         let artist = self.artist.read(cx).value().to_string();
         let title = self.title.read(cx).value().to_string();
         let provider = self.provider;
+        let path = self.path.clone();
+        let keys = cx
+            .try_global::<crate::settings::Settings>()
+            .map(|settings| settings.lookup_keys())
+            .unwrap_or_default();
         self.searches += 1;
         let search = self.searches;
         self.searching = true;
@@ -128,7 +139,12 @@ impl LookupView {
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { lookup::search(provider, &artist, &title) })
+                .background_spawn(async move {
+                    match provider {
+                        Provider::AcoustId => identify_by_sound(&path, &keys.acoustid),
+                        _ => lookup::search(provider, &artist, &title),
+                    }
+                })
                 .await;
             this.update(cx, |this, cx| {
                 if this.searches != search {
@@ -200,7 +216,7 @@ impl LookupView {
             .label(current.label())
             .dropdown_caret(true)
             .dropdown_menu(move |mut menu, _, _| {
-                for provider in Provider::ALL {
+                for provider in Provider::ALL.into_iter().chain([Provider::AcoustId]) {
                     let view = view.clone();
                     menu = menu.item(
                         PopupMenuItem::new(provider.label())
@@ -355,6 +371,27 @@ impl LookupView {
                 .children(rows),
         )
     }
+}
+
+/// AcoustID decodes at this rate itself, so there is no point in more.
+const FINGERPRINT_RATE: u32 = 11_025;
+
+/// Decodes a track, fingerprints its sound and asks AcoustID what it is.
+fn identify_by_sound(path: &Path, key: &str) -> djcraft_library::Result<Vec<TrackMatch>> {
+    if key.is_empty() {
+        // Before decoding anything: say what is missing.
+        return lookup::identify(key, "", 0);
+    }
+    let track = djcraft_engine::Track::decode(path, FINGERPRINT_RATE).map_err(|error| {
+        djcraft_library::Error::Lookup(format!("The track could not be read: {error}"))
+    })?;
+    let print =
+        djcraft_analysis::fingerprint(&track.mono(), FINGERPRINT_RATE).ok_or_else(|| {
+            djcraft_library::Error::Lookup(
+                "The track is too short to identify by its sound.".into(),
+            )
+        })?;
+    lookup::identify(key, &print.encoded, print.duration_seconds)
 }
 
 impl EventEmitter<LookupEvent> for LookupView {}

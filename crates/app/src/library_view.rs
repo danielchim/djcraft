@@ -1393,7 +1393,10 @@ impl LibraryView {
             self.field_text(EditField::Genre, cx),
         ];
         let provider = self.provider;
-        let lookup = cx.new(|cx| LookupView::new(current, provider, window, cx));
+        let Some(path) = self.inspected.as_ref().map(|track| track.path.clone()) else {
+            return;
+        };
+        let lookup = cx.new(|cx| LookupView::new(current, provider, path, window, cx));
         cx.subscribe_in(
             &lookup,
             window,

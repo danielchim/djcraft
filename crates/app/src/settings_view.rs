@@ -2,6 +2,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     ActiveTheme, Icon, Sizable,
     button::{Button, ButtonVariants},
+    input::{Input, InputEvent, InputState},
     menu::{DropdownMenu, PopupMenuItem},
     switch::Switch,
 };
@@ -95,6 +96,9 @@ pub struct SettingsView {
     /// A description of the audio output in use.
     audio: SharedString,
     focus: FocusHandle,
+    /// A text box for the AcoustID key, made on first draw, as making it
+    /// needs the window.
+    key_inputs: Option<[Entity<InputState>; 1]>,
 }
 
 impl SettingsView {
@@ -104,7 +108,35 @@ impl SettingsView {
             page: Page::Preferences,
             audio,
             focus: cx.focus_handle(),
+            key_inputs: None,
         }
+    }
+
+    /// Makes the key text box, filled in from the settings, and saves what
+    /// is typed into it.
+    fn make_key_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.key_inputs.is_some() {
+            return;
+        }
+        let values = [self.settings.acoustid_key.clone()];
+        let inputs = values.map(|value| {
+            cx.new(|cx| {
+                let mut input = InputState::new(window, cx).placeholder("Not set");
+                input.set_value(value, window, cx);
+                input
+            })
+        });
+        for (slot, input) in inputs.iter().enumerate() {
+            cx.subscribe(input, move |this, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let value = input.read(cx).value().trim().to_string();
+                    let _ = slot;
+                    this.change(|settings| settings.acoustid_key = value, cx);
+                }
+            })
+            .detach();
+        }
+        self.key_inputs = Some(inputs);
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -432,14 +464,27 @@ impl SettingsView {
                     ],
                     cx,
                 );
+                let key_box = |slot: usize| {
+                    div()
+                        .w(px(260.))
+                        .children(self.key_inputs.as_ref().map(|inputs| Input::new(&inputs[slot])))
+                };
                 let music_info = self.section(
                     "Music info",
-                    vec![self.row(
-                        "Look up tracks with",
-                        "The online database searched when you press Look up on a track. MusicBrainz covers more releases; the iTunes Store gives cleaner albums and a genre.",
-                        provider,
-                        cx,
-                    )],
+                    vec![
+                        self.row(
+                            "Look up tracks with",
+                            "The online database Look up searches first. MusicBrainz covers more releases; the iTunes Store gives cleaner albums and a genre. You can switch in the Look up window.",
+                            provider,
+                            cx,
+                        ),
+                        self.row(
+                            "AcoustID key",
+                            "Identifies a track by its sound when its tags are wrong or missing. Get a free application key at acoustid.org/new-application and paste it here.",
+                            key_box(0),
+                            cx,
+                        ),
+                    ],
                     cx,
                 );
                 vec![self.section(
@@ -522,7 +567,8 @@ impl SettingsView {
 impl EventEmitter<SettingsEvent> for SettingsView {}
 
 impl Render for SettingsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.make_key_inputs(window, cx);
         let page = self.page;
         let sections = self.page(cx);
         let sidebar = self.sidebar(cx).into_any_element();
