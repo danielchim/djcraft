@@ -22,12 +22,12 @@ Status key: `[ ]` to do, `[~]` in progress, `[x]` done.
 ## Milestone 0: foundations
 
 - [x] Cargo workspace with separate crates: `engine`, `library`, `protocol`, `app`
-- [~] Licence allow-list enforced in CI with `cargo-deny` (`deny.toml` passes
-      locally; the CI workflow has not run yet)
+- [x] Licence allow-list enforced in CI with `cargo-deny`
 - [x] Spike: GPUI window drawing a scrolling waveform while the engine plays a
       time-stretched track
-- [~] Confirm `gpui-kit` builds and runs on macOS, Windows and Linux (macOS
-      confirmed; Windows and Linux wait on the first CI run)
+- [~] Confirm `gpui-kit` builds and runs on macOS, Windows and Linux (builds
+      and passes the tests on all three in CI; the app has only been run on
+      macOS)
 - [x] Real-time-safe engine design: no allocation, locking or UI calls on the
       audio thread; lock-free queues between engine and UI
 - [x] Deck playback that follows an external speed and position signal,
@@ -40,23 +40,23 @@ Status key: `[ ]` to do, `[~]` in progress, `[x]` done.
 
 ### Sources
 
-- [~] Local files and folders, with watch-for-changes (folders are scanned at
-      start-up and when added; no live watching yet)
+- [x] Local files and folders, with watch-for-changes (watching has only
+      been tried on macOS)
 - [ ] Network shares
 - [ ] External sources as optional plugins (YouTube and similar through a
       user-installed `yt-dlp`); see Plugins
 
 ### Analysis
 
-- [~] BPM and beat grid detection (constant-tempo tracks, analysed in the
-      background; the grid is stored but not drawn yet, and bars are not
-      detected)
-- [ ] Key detection
-- [ ] Waveform generation (overview and detail)
-- [~] Analysis cache stored alongside the library database (tempo results
-      are in the library database; waveforms are in the user cache folder)
-- [ ] Tempo range limits (minimum and maximum BPM) and precision setting
-- [ ] Option to keep an existing tempo or key instead of overwriting it
+- [~] BPM and beat grid detection (constant tempo and four beats to the bar
+      only; tested on synthetic audio only, so accuracy on real tracks is
+      not measured yet)
+- [~] Key detection (one key per track, major or minor; tested on
+      synthetic music only, so accuracy on real tracks is not measured yet)
+- [x] Waveform generation (overview and detail)
+- [x] Analysis cache stored alongside the library database
+- [x] Tempo range limits (minimum and maximum BPM) and precision setting
+- [x] Option to keep an existing tempo or key instead of overwriting it
 
 ### Harmonic mixing and energy
 
@@ -64,7 +64,8 @@ Feature set modelled on Mixed In Key 10.
 
 - [~] Camelot wheel notation, with a choice of notation (Camelot, musical,
       Open Key) and optional zero-padding (`08A`) (keys in tags are read in
-      any of the three and shown as Camelot; no choice of notation yet)
+      any of the three and shown as Camelot, as are detected keys; no choice
+      of notation yet)
 - [ ] Key segments: key changes within a track, each with a confidence value
 - [ ] Tuning detection for tracks not pitched to A440
 - [~] Energy level per track on a 1–10 scale (from loudness, so loudly
@@ -86,27 +87,33 @@ Feature set modelled on Mixed In Key 10.
 
 ### Tags
 
-- [~] Read and write tags across MP3, FLAC, AAC, WAV, OGG (title, artist,
-      album, genre, BPM and key, one track at a time from the info panel;
-      writing is tested on WAV only)
-- [ ] Audio fingerprint lookup (Chromaprint/AcoustID)
-- [~] Metadata match from MusicBrainz and Discogs (MusicBrainz search by
-      artist and title from the info panel; no Discogs yet)
-- [ ] Review-and-diff screen before any tag is written
-- [ ] Batch tag alignment with undo
-- [ ] Choose where key and energy are written: key field, comment, grouping,
+- [x] Read and write tags across MP3, FLAC, AAC, WAV, OGG (also Opus and
+      AIFF; title, artist, album, genre, BPM, key, comment and grouping are
+      tested in each, apart from raw .aac files)
+- [~] Audio fingerprint lookup (Chromaprint/AcoustID) (fingerprints are made
+      by a pure-Rust Chromaprint port and sent to AcoustID with the user's own
+      key; a successful match is untested, as no key was at hand)
+- [~] Metadata match from MusicBrainz and Discogs (MusicBrainz, the iTunes
+      Store and Discogs, searched from a popup that tidies untidy tags, ranks
+      the results and prefers original releases; Discogs needs the user's own
+      token and is untested against the live service)
+- [x] Review-and-diff screen before any tag is written
+- [x] Batch tag alignment with undo (writes the analysed BPM, key and energy
+      into the tags of every track in the list; any batch of tag changes can
+      be undone)
+- [x] Choose where key and energy are written: key field, comment, grouping,
       or as a prefix/suffix on title or artist
-- [ ] Tag clean-up tools: find and replace across the library, remove extra
+- [x] Tag clean-up tools: find and replace across the library, remove extra
       spaces, fix capitalisation
-- [ ] Rename files from tags using a format template
+- [x] Rename files from tags using a format template (files stay in their
+      folder)
 
 ### Flow (set planning)
 
 - [~] Timeline editor with four lanes, matching the decks: place tracks,
       move them between lanes, and trim either end (built; planning only, no
       audio)
-- [~] Trim snaps to the track's bars; a moved clip snaps to other clips' edges
-      (bars are counted from the first beat, since downbeats are not detected)
+- [x] Trim snaps to the track's bars; a moved clip snaps to other clips' edges
 - [~] Transition notes where one track comes in over another: tempo change
       and whether the keys mix
 - [~] Add tracks by double-click (appended with a typical overlap) or by
@@ -127,15 +134,19 @@ Feature set modelled on Mixed In Key 10.
 
 ### Organisation
 
-- [~] Track browser with virtualised table, sorting, column chooser, search
-      (no column chooser yet)
-- [~] Playlists and folders (create from a dialog, delete, add and remove
-      tracks, export; no rename, reordering or folders in the UI yet)
-- [ ] Smart playlists (rule-based)
-- [ ] Auto-classification by genre, energy and era
-- [ ] Key/BPM compatibility hints for the next track
-- [ ] Duplicate detection
-- [ ] Missing-file relocation
+- [x] Track browser with virtualised table, sorting, column chooser, search
+- [~] Playlists and folders (folders inside folders, rename, move, reorder
+      from a track's menu; no drag and drop yet)
+- [x] Smart playlists (rule-based) (title, artist, album, genre, BPM,
+      energy, year, key or keys that mix, and date added; every rule or any)
+- [x] Auto-classification by genre, energy and era (automatic groups in the
+      Library sidebar, from tags and analysis)
+- [x] Key/BPM compatibility hints for the next track ("Suggest next" in the
+      browser under the decks, for the track loaded last)
+- [x] Duplicate detection (same artist and title with about the same length,
+      or the same file size; copies leave the library, files stay on disk)
+- [x] Missing-file relocation (missing tracks are kept and marked; files
+      that move within a folder are followed by themselves)
 
 ### Interoperability
 
@@ -162,10 +173,11 @@ Feature set modelled on Mixed In Key 10.
 
 ### Decks
 
-- [ ] Two decks with scrolling and overview waveforms
-- [ ] Play/pause, cue, jump to start
-- [ ] Tempo fader with selectable ranges
-- [ ] Master tempo (key lock)
+- [x] Two decks with scrolling and overview waveforms
+- [~] Play/pause, cue, jump to start (play and pause only)
+- [~] Tempo fader with selectable ranges (slower and faster buttons in 1%
+      steps over one fixed range; no fader)
+- [x] Master tempo (key lock)
 - [ ] Beat sync and quantize
 - [ ] Hot cues (8 per deck)
 - [ ] Memory cues
@@ -174,7 +186,9 @@ Feature set modelled on Mixed In Key 10.
 
 ### Mixer
 
-- [ ] Trim, channel fader, crossfader with selectable curves
+- [~] Trim, channel fader, crossfader with selectable curves (the engine
+      and protocol have a volume per deck and a master gain; no controls on
+      screen, and no trim or crossfader)
 - [ ] 3-band EQ
 - [ ] Channel filter
 - [ ] Headphone cue with cue/master mix
@@ -377,10 +391,12 @@ waveforms, and options tucked into popovers.
 - [ ] Deck tool tabs under each deck: cues, loops, beat jump, slicer, keyboard,
       stems, FX
 - [ ] Popover panels for per-deck options: BPM, key, beat grid, EQ, crossfader
-- [ ] Drag and drop from library to deck, deck to deck, and into playlists
+- [~] Drag and drop from library to deck, deck to deck, and into playlists
+      (tracks can be dragged from the library onto Flow's lanes only)
 - [ ] First-run setup wizard: theme, waveform style, jog wheels on or off,
       import an existing library
-- [ ] Light and dark themes, plus user themes
+- [~] Light and dark themes, plus user themes (light, dark and match-system;
+      no user themes)
 - [ ] Keyboard shortcut editor
 - [ ] Separate metering window
 - [ ] Layouts that scale from a laptop screen to a large display, with the same

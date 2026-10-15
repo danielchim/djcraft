@@ -1,9 +1,12 @@
 mod analysis;
 mod flow_view;
 mod library_view;
+mod lookup_view;
+mod organise_view;
 mod settings;
 mod settings_view;
 mod shell;
+mod tag_tools;
 mod waveform;
 
 use gpui_kit::assets::AllAssets;
@@ -18,6 +21,9 @@ fn main() {
     gpui_kit::application().with_assets(AllAssets).run(|cx| {
         gpui_kit::init(cx);
         let settings = settings::Settings::load(&settings::data_dir());
+        settings::move_old_waveforms();
+        // Views read display settings, such as how tempos are shown, from here.
+        cx.set_global(settings.clone());
         settings.apply_theme(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([

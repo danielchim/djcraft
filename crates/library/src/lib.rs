@@ -9,7 +9,10 @@ mod export;
 mod flow;
 mod import;
 pub mod lookup;
+mod organise;
 mod scan;
+mod tags;
+mod watch;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -25,14 +28,77 @@ pub use flow::{
     MIN_CLIP_SPEED,
 };
 pub use import::{ImportSummary, ImportedPlaylist, read_playlists};
+pub use organise::{
+    DuplicateGroup, EnergyBand, Group, GroupCount, KeyFit, PlaylistFolder, Rule, SmartRules,
+    Suggestion, TextField, TextOp,
+};
 pub use scan::{Artwork, ScanProgress, ScanSummary, TrackEdit, read_artwork};
+pub use tags::{AlignOptions, ApplySummary, Cleanup, Placement, PlannedChange, TagBatch, TagField};
+pub use watch::FolderWatcher;
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 16;
 
 /// A measured tempo is shown only when the analysis was at least this sure
 /// of it. Below that (mixes with several tempos, music with no clear beat)
 /// the tempo in the file's tags is shown instead.
 const MIN_TEMPO_CONFIDENCE: f64 = 0.1;
+/// A detected key is shown only when the track's notes fit it at least this
+/// well. Below that (drum tracks, speech, music that changes key) the track
+/// is left without one.
+const MIN_KEY_CONFIDENCE: f64 = 0.5;
+
+/// SQL for the tempo a track is listed with, over `tracks t`: a tempo typed
+/// in by hand, else a trustworthy measurement, else the tags' tempo. With
+/// [`KeepTagged::tempo`], the tags' tempo comes before the measurement.
+fn shown_bpm_sql() -> String {
+    format!(
+        "CASE WHEN t.bpm_manual = 0 AND t.tempo_confidence >= {MIN_TEMPO_CONFIDENCE}
+                   AND NOT (t.bpm IS NOT NULL AND {keep})
+              THEN t.tempo_bpm ELSE t.bpm END",
+        keep = option_sql("keep_tagged_tempo", KeepTagged::default().tempo),
+    )
+}
+
+/// SQL for the key a track is listed with, over `tracks t`: a key typed in
+/// by hand, else the tags' key or a trustworthy detected one, in the order
+/// [`KeepTagged::key`] sets.
+fn shown_key_sql() -> String {
+    let detected =
+        format!("CASE WHEN t.key_confidence >= {MIN_KEY_CONFIDENCE} THEN t.key_detected END");
+    format!(
+        "CASE WHEN t.key_manual = 1 OR {keep} THEN COALESCE(t.key, {detected})
+              ELSE COALESCE({detected}, t.key) END",
+        keep = option_sql("keep_tagged_key", KeepTagged::default().key),
+    )
+}
+
+fn option_sql(name: &str, default: bool) -> String {
+    format!(
+        "COALESCE((SELECT value FROM options WHERE name = '{name}'), {})",
+        default as i64
+    )
+}
+
+/// Whether what a file's tags say about its tempo and key is listed in
+/// place of what analysis measured. Either way, the measurement is kept,
+/// and a beat grid always comes from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeepTagged {
+    pub tempo: bool,
+    pub key: bool,
+}
+
+impl Default for KeepTagged {
+    /// Measured tempos are usually more precise than tagged ones, while a
+    /// key in the tags has often been set with care, by the user or by
+    /// another program.
+    fn default() -> Self {
+        Self {
+            tempo: false,
+            key: true,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -46,6 +112,10 @@ pub enum Error {
     Tags(String),
     /// An online lookup failed.
     Lookup(String),
+    /// A change to the library could not be made, for the reason given.
+    Library(String),
+    /// A folder could not be watched for changes.
+    Watch(String),
 }
 
 impl fmt::Display for Error {
@@ -56,6 +126,8 @@ impl fmt::Display for Error {
             Error::Import(message) => write!(f, "cannot import: {message}"),
             Error::Tags(message) => write!(f, "cannot write tags: {message}"),
             Error::Lookup(message) => f.write_str(message),
+            Error::Library(message) => f.write_str(message),
+            Error::Watch(message) => write!(f, "cannot watch folder: {message}"),
             Error::NewerSchema(version) => write!(
                 f,
                 "library was created by a newer version (schema {version})"
@@ -115,12 +187,20 @@ pub struct Track {
     /// The measured tempo when there is a trustworthy one, otherwise the
     /// tempo from the file's tags.
     pub bpm: Option<f64>,
-    /// The key as the file's tags spell it.
+    /// The key as the file's tags spell it. For a file with no key in its
+    /// tags, the detected key when there is a trustworthy one, in Camelot
+    /// notation.
     pub key: Option<String>,
-    /// The key's place on the Camelot wheel, when the tag can be understood.
+    /// The key's place on the Camelot wheel, when it can be understood.
     pub camelot: Option<Camelot>,
     /// Energy of the track as a whole, 1 to 10, once analysed.
     pub energy: Option<u8>,
+    /// The year in the file's tags.
+    pub year: Option<i32>,
+    /// The file was not found at the last scan.
+    pub missing: bool,
+    /// When the track joined the library, in seconds since 1970.
+    pub added_at: i64,
 }
 
 /// A point in a track where a new section begins.
@@ -131,13 +211,40 @@ pub struct CuePoint {
     pub energy: u8,
 }
 
+/// What key analysis found for a track.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KeyResult {
+    pub key: Camelot,
+    /// 0.0 to 1.0.
+    pub confidence: f64,
+}
+
 /// What tempo analysis found for a track.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TempoResult {
     pub bpm: f64,
     pub first_beat_seconds: f64,
+    /// Which of the first four beats starts a bar, counting the first beat
+    /// as 0.
+    pub downbeat: u8,
     /// 0.0 to 1.0.
     pub confidence: f64,
+}
+
+impl TempoResult {
+    pub fn beat_seconds(&self) -> f64 {
+        60.0 / self.bpm
+    }
+
+    /// The length of one bar, taking four beats to the bar.
+    pub fn bar_seconds(&self) -> f64 {
+        4.0 * self.beat_seconds()
+    }
+
+    /// Time of the first beat that starts a bar.
+    pub fn first_bar_seconds(&self) -> f64 {
+        self.first_beat_seconds + self.downbeat as f64 * self.beat_seconds()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -145,6 +252,10 @@ pub struct Playlist {
     pub id: i64,
     pub name: String,
     pub track_count: usize,
+    /// The folder it is in; `None` at the top level.
+    pub folder: Option<i64>,
+    /// For a smart playlist, the rules that choose its tracks.
+    pub rules: Option<SmartRules>,
 }
 
 /// Which tracks to list.
@@ -160,6 +271,8 @@ pub struct TrackQuery {
     pub search: String,
     /// Only tracks in one of these keys. Empty means any key.
     pub keys: Vec<Camelot>,
+    /// Only tracks in this automatic group.
+    pub group: Option<Group>,
 }
 
 /// One connection to the library database. Open one per thread; they share
@@ -329,7 +442,158 @@ impl Library {
                  COMMIT;",
             )?;
         }
+        if version < 9 {
+            // The key found by analysis, in Camelot notation. It stands in
+            // for a key the file's tags do not give; `key` stays what the
+            // tags say.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE tracks ADD COLUMN key_detected TEXT;
+                 ALTER TABLE tracks ADD COLUMN key_confidence REAL;
+                 PRAGMA user_version = 9;
+                 COMMIT;",
+            )?;
+        }
+        if version < 10 {
+            // Which beat starts a bar; options that change how tracks are
+            // listed, shared by every connection; and a mark for a key the
+            // user typed in, which then stands over any detected one.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE tracks ADD COLUMN tempo_downbeat INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE tracks ADD COLUMN key_manual INTEGER NOT NULL DEFAULT 0;
+                 CREATE TABLE options (
+                     name TEXT PRIMARY KEY,
+                     value INTEGER NOT NULL
+                 );
+                 PRAGMA user_version = 10;
+                 COMMIT;",
+            )?;
+        }
+        if version < 11 {
+            // Tag changes written together, with each file's old and new
+            // tags and names, so that a batch can be undone.
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE tag_batches (
+                     id INTEGER PRIMARY KEY,
+                     label TEXT NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     undone INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE tag_history (
+                     batch_id INTEGER NOT NULL REFERENCES tag_batches (id) ON DELETE CASCADE,
+                     track_id INTEGER REFERENCES tracks (id) ON DELETE SET NULL,
+                     path_before TEXT NOT NULL,
+                     path_after TEXT NOT NULL,
+                     before TEXT NOT NULL,
+                     after TEXT NOT NULL
+                 );
+                 CREATE INDEX tag_history_batch ON tag_history (batch_id);
+                 PRAGMA user_version = 11;
+                 COMMIT;",
+            )?;
+        }
+        if version < 12 {
+            // The year from the tags. `year_checked` marks tracks whose tags
+            // have been looked at for it, so older libraries can catch up.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE tracks ADD COLUMN year INTEGER;
+                 ALTER TABLE tracks ADD COLUMN year_checked INTEGER NOT NULL DEFAULT 0;
+                 PRAGMA user_version = 12;
+                 COMMIT;",
+            )?;
+        }
+        if version < 13 {
+            // Tracks whose files have gone are kept, so that they can be
+            // found again.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE tracks ADD COLUMN missing INTEGER NOT NULL DEFAULT 0;
+                 PRAGMA user_version = 13;
+                 COMMIT;",
+            )?;
+        }
+        if version < 14 {
+            // Folders of playlists, which may sit in other folders.
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE playlist_folders (
+                     id INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL,
+                     parent_id INTEGER REFERENCES playlist_folders (id) ON DELETE CASCADE,
+                     created_at INTEGER NOT NULL
+                 );
+                 ALTER TABLE playlists ADD COLUMN folder_id INTEGER
+                     REFERENCES playlist_folders (id) ON DELETE SET NULL;
+                 PRAGMA user_version = 14;
+                 COMMIT;",
+            )?;
+        }
+        if version < 15 {
+            // The rules of a smart playlist, which chooses its own tracks.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE playlists ADD COLUMN rules TEXT;
+                 PRAGMA user_version = 15;
+                 COMMIT;",
+            )?;
+        }
+        if version < 16 {
+            // Files left out of the library on purpose, such as duplicates,
+            // which scans do not add back.
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE ignored_files (
+                     source_id INTEGER NOT NULL REFERENCES sources (id) ON DELETE CASCADE,
+                     locator TEXT NOT NULL,
+                     PRIMARY KEY (source_id, locator)
+                 );
+                 PRAGMA user_version = 16;
+                 COMMIT;",
+            )?;
+        }
         Ok(Self { conn })
+    }
+
+    pub fn keep_tagged(&self) -> Result<KeepTagged> {
+        let option = |name: &str, default: bool| -> Result<bool> {
+            Ok(self
+                .conn
+                .query_row("SELECT value FROM options WHERE name = ?1", [name], |row| {
+                    row.get(0)
+                })
+                .optional()?
+                .unwrap_or(default))
+        };
+        let default = KeepTagged::default();
+        Ok(KeepTagged {
+            tempo: option("keep_tagged_tempo", default.tempo)?,
+            key: option("keep_tagged_key", default.key)?,
+        })
+    }
+
+    pub fn set_keep_tagged(&self, keep: KeepTagged) -> Result<()> {
+        for (name, on) in [
+            ("keep_tagged_tempo", keep.tempo),
+            ("keep_tagged_key", keep.key),
+        ] {
+            self.conn.execute(
+                "INSERT INTO options (name, value) VALUES (?1, ?2)
+                 ON CONFLICT (name) DO UPDATE SET value = excluded.value",
+                params![name, on],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Marks every track as needing analysis again, as after a change to how
+    /// it is done. Returns how many there are.
+    pub fn reset_analysis(&self) -> Result<usize> {
+        Ok(self
+            .conn
+            .execute("UPDATE tracks SET tempo_version = NULL", [])?)
     }
 
     /// Tracks whose tempo has not been analysed by this `version` of the
@@ -355,14 +619,28 @@ impl Library {
     pub fn store_tempo(&self, id: i64, version: i64, tempo: Option<TempoResult>) -> Result<()> {
         self.conn.execute(
             "UPDATE tracks SET tempo_bpm = ?2, tempo_first_beat = ?3, tempo_confidence = ?4,
-                               tempo_version = ?5
+                               tempo_downbeat = ?5, tempo_version = ?6
              WHERE id = ?1",
             params![
                 id,
                 tempo.map(|t| t.bpm),
                 tempo.map(|t| t.first_beat_seconds),
                 tempo.map(|t| t.confidence),
+                tempo.map_or(0, |t| t.downbeat),
                 version
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Records the outcome of key analysis; `None` when no key was found.
+    pub fn store_key(&self, id: i64, key: Option<KeyResult>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tracks SET key_detected = ?2, key_confidence = ?3 WHERE id = ?1",
+            params![
+                id,
+                key.map(|k| k.key.to_string()),
+                key.map(|k| k.confidence)
             ],
         )?;
         Ok(())
@@ -433,18 +711,48 @@ impl Library {
         Ok(cues.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// The beat grid measured for a track: its tempo and first beat.
+    /// The library track stored at `path`, if there is one. The path may
+    /// go through a link (such as `/tmp` on macOS); folders are stored by
+    /// their real path.
+    pub fn track_at(&self, path: &Path) -> Result<Option<i64>> {
+        let real = canonical(path).unwrap_or_else(|_| path.to_path_buf());
+        let path = real.as_path();
+        for source in self.sources()? {
+            let locator = match source.kind {
+                SourceKind::Folder => match path.strip_prefix(&source.location) {
+                    Ok(relative) => relative.to_string_lossy().into_owned(),
+                    Err(_) => continue,
+                },
+                SourceKind::Files => path.to_string_lossy().into_owned(),
+            };
+            let id = self
+                .conn
+                .query_row(
+                    "SELECT id FROM tracks WHERE source_id = ?1 AND locator = ?2",
+                    params![source.id, locator],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if id.is_some() {
+                return Ok(id);
+            }
+        }
+        Ok(None)
+    }
+
+    /// The beat grid measured for a track: its tempo, first beat and bars.
     pub fn beat_grid(&self, id: i64) -> Result<Option<TempoResult>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT tempo_bpm, tempo_first_beat, tempo_confidence FROM tracks
+                "SELECT tempo_bpm, tempo_first_beat, tempo_confidence, tempo_downbeat FROM tracks
                  WHERE id = ?1 AND tempo_bpm IS NOT NULL AND tempo_confidence >= ?2",
                 params![id, MIN_TEMPO_CONFIDENCE],
                 |row| {
                     Ok(TempoResult {
                         bpm: row.get(0)?,
                         first_beat_seconds: row.get(1)?,
+                        downbeat: row.get(3)?,
                         confidence: row.get(2)?,
                     })
                 },
@@ -465,24 +773,53 @@ impl Library {
             id: self.conn.last_insert_rowid(),
             name: name.to_string(),
             track_count: 0,
+            folder: None,
+            rules: None,
         })
     }
 
-    /// All playlists, oldest first.
+    /// All playlists, oldest first. A smart playlist's count is of the
+    /// tracks its rules choose now.
     pub fn playlists(&self) -> Result<Vec<Playlist>> {
         let mut statement = self.conn.prepare(
-            "SELECT p.id, p.name, COUNT(pt.track_id)
+            "SELECT p.id, p.name, COUNT(pt.track_id), p.folder_id, p.rules
              FROM playlists p LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id
              GROUP BY p.id ORDER BY p.created_at, p.id",
         )?;
         let playlists = statement.query_map([], |row| {
-            Ok(Playlist {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                track_count: row.get::<_, i64>(2)? as usize,
-            })
+            Ok((
+                Playlist {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    track_count: row.get::<_, i64>(2)? as usize,
+                    folder: row.get(3)?,
+                    rules: None,
+                },
+                row.get::<_, Option<String>>(4)?,
+            ))
         })?;
-        Ok(playlists.collect::<rusqlite::Result<_>>()?)
+        let mut playlists: Vec<(Playlist, Option<String>)> =
+            playlists.collect::<rusqlite::Result<_>>()?;
+        let mut everything: Option<Vec<Track>> = None;
+        for (playlist, rules) in &mut playlists {
+            let Some(rules) = rules.as_deref().and_then(SmartRules::from_json) else {
+                continue;
+            };
+            if everything.is_none() {
+                everything = Some(self.tracks(&TrackQuery::default())?);
+            }
+            let now = organise::now();
+            playlist.track_count = everything
+                .iter()
+                .flatten()
+                .filter(|track| rules.matches(track, now))
+                .count();
+            playlist.rules = Some(rules);
+        }
+        Ok(playlists
+            .into_iter()
+            .map(|(playlist, _)| playlist)
+            .collect())
     }
 
     pub fn rename_playlist(&self, id: i64, name: &str) -> Result<()> {
@@ -501,8 +838,13 @@ impl Library {
     }
 
     /// Appends tracks to a playlist, skipping any it already contains.
-    /// Returns how many were added.
+    /// Returns how many were added. A smart playlist chooses its own tracks.
     pub fn add_to_playlist(&mut self, playlist: i64, tracks: &[i64]) -> Result<usize> {
+        if self.playlist_rules(playlist)?.is_some() {
+            return Err(Error::Library(
+                "a smart playlist chooses its own tracks from its rules".into(),
+            ));
+        }
         let transaction = self.conn.transaction()?;
         let mut position: i64 = transaction.query_row(
             "SELECT COALESCE(MAX(position), 0) FROM playlist_tracks WHERE playlist_id = ?1",
@@ -579,23 +921,32 @@ impl Library {
     /// Lists tracks, ordered by artist and then title, or in playlist order
     /// when the query names a playlist.
     pub fn tracks(&self, query: &TrackQuery) -> Result<Vec<Track>> {
-        let mut sql = String::from(
+        // A smart playlist is the library, filtered by its rules.
+        if let Some(playlist) = query.playlist
+            && let Some(rules) = self.playlist_rules(playlist)?
+        {
+            let all = TrackQuery {
+                playlist: None,
+                ..query.clone()
+            };
+            let now = organise::now();
+            let mut tracks = self.tracks(&all)?;
+            tracks.retain(|track| rules.matches(track, now));
+            return Ok(tracks);
+        }
+        let mut sql = format!(
             "SELECT t.id, t.source_id, s.location, t.locator, t.title, t.artist, t.album,
-                    t.genre, t.duration,
-                    CASE WHEN t.bpm_manual = 0 AND t.tempo_confidence >= ?3
-                         THEN t.tempo_bpm ELSE t.bpm END,
-                    t.key, t.energy, s.name, s.kind
+                    t.genre, t.duration, {bpm}, {key}, t.energy, s.name, s.kind,
+                    t.year, t.missing, t.added_at
              FROM tracks t JOIN sources s ON s.id = t.source_id
              LEFT JOIN playlist_tracks pt ON pt.track_id = t.id AND pt.playlist_id = ?2
              WHERE (?1 IS NULL OR t.source_id = ?1) AND (?2 IS NULL OR pt.track_id IS NOT NULL)
-               AND (?4 IS NULL OR t.id = ?4)",
+               AND (?3 IS NULL OR t.id = ?3)",
+            bpm = shown_bpm_sql(),
+            key = shown_key_sql(),
         );
-        let mut values: Vec<rusqlite::types::Value> = vec![
-            query.source.into(),
-            query.playlist.into(),
-            MIN_TEMPO_CONFIDENCE.into(),
-            query.id.into(),
-        ];
+        let mut values: Vec<rusqlite::types::Value> =
+            vec![query.source.into(), query.playlist.into(), query.id.into()];
         for word in query.search.split_whitespace() {
             let escaped = word
                 .replace('\\', "\\\\")
@@ -607,6 +958,11 @@ impl Library {
                 " AND (t.title LIKE ?{n} ESCAPE '\\' OR t.artist LIKE ?{n} ESCAPE '\\'
                    OR t.album LIKE ?{n} ESCAPE '\\' OR t.genre LIKE ?{n} ESCAPE '\\')"
             ));
+        }
+        if let Some(group) = &query.group {
+            let (condition, value) = group.sql(values.len() + 1);
+            sql.push_str(&condition);
+            values.extend(value);
         }
         sql.push_str(if query.playlist.is_some() {
             " ORDER BY pt.position"
@@ -633,6 +989,9 @@ impl Library {
                 energy: row.get(11)?,
                 source_name: row.get(12)?,
                 source_kind: source_kind(&row.get::<_, String>(13)?),
+                year: row.get(14)?,
+                missing: row.get(15)?,
+                added_at: row.get(16)?,
             })
         })?;
         let mut tracks: Vec<Track> = tracks.collect::<rusqlite::Result<_>>()?;
@@ -650,11 +1009,11 @@ impl Library {
     pub fn key_counts(&self) -> Result<HashMap<Camelot, usize>> {
         let mut statement = self
             .conn
-            .prepare("SELECT key FROM tracks WHERE key IS NOT NULL")?;
-        let keys = statement.query_map([], |row| row.get::<_, String>(0))?;
+            .prepare(&format!("SELECT {} FROM tracks t", shown_key_sql()))?;
+        let keys = statement.query_map([], |row| row.get::<_, Option<String>>(0))?;
         let mut counts = HashMap::new();
         for key in keys {
-            if let Some(key) = Camelot::parse(&key?) {
+            if let Some(key) = key?.as_deref().and_then(Camelot::parse) {
                 *counts.entry(key).or_insert(0) += 1;
             }
         }
@@ -677,7 +1036,7 @@ pub(crate) fn canonical(path: &Path) -> io::Result<PathBuf> {
     })
 }
 
-fn source_kind(kind: &str) -> SourceKind {
+pub(crate) fn source_kind(kind: &str) -> SourceKind {
     match kind {
         "files" => SourceKind::Files,
         _ => SourceKind::Folder,

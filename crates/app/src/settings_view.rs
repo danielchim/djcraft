@@ -2,15 +2,17 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     ActiveTheme, Icon, Sizable,
     button::{Button, ButtonVariants},
+    input::{Input, InputEvent, InputState},
     menu::{DropdownMenu, PopupMenuItem},
     switch::Switch,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use djcraft_library::Placement;
 use djcraft_library::lookup::Provider;
 
-use crate::settings::{Settings, StartTab, ThemeChoice, data_dir};
+use crate::settings::{self, Settings, StartTab, ThemeChoice, data_dir};
 
 actions!(settings, [CloseSettings]);
 
@@ -94,6 +96,9 @@ pub struct SettingsView {
     /// A description of the audio output in use.
     audio: SharedString,
     focus: FocusHandle,
+    /// Text boxes for the AcoustID key and the Discogs token, made on first
+    /// draw, as making them needs the window.
+    key_inputs: Option<[Entity<InputState>; 2]>,
 }
 
 impl SettingsView {
@@ -103,7 +108,43 @@ impl SettingsView {
             page: Page::Preferences,
             audio,
             focus: cx.focus_handle(),
+            key_inputs: None,
         }
+    }
+
+    /// Makes the key and token text boxes, filled in from the settings, and
+    /// saves what is typed into them.
+    fn make_key_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.key_inputs.is_some() {
+            return;
+        }
+        let values = [
+            self.settings.acoustid_key.clone(),
+            self.settings.discogs_token.clone(),
+        ];
+        let inputs = values.map(|value| {
+            cx.new(|cx| {
+                let mut input = InputState::new(window, cx).placeholder("Not set");
+                input.set_value(value, window, cx);
+                input
+            })
+        });
+        for (slot, input) in inputs.iter().enumerate() {
+            cx.subscribe(input, move |this, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let value = input.read(cx).value().trim().to_string();
+                    this.change(
+                        |settings| match slot {
+                            0 => settings.acoustid_key = value,
+                            _ => settings.discogs_token = value,
+                        },
+                        cx,
+                    );
+                }
+            })
+            .detach();
+        }
+        self.key_inputs = Some(inputs);
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -311,6 +352,12 @@ impl SettingsView {
                         let checked = *checked;
                         this.change(|settings| settings.scan_on_startup = checked, cx);
                     }));
+                let watch = Switch::new("watch-folders")
+                    .checked(self.settings.watch_folders)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        let checked = *checked;
+                        this.change(|settings| settings.watch_folders = checked, cx);
+                    }));
                 let provider = self.dropdown(
                     "info-provider",
                     self.settings.info_provider,
@@ -319,14 +366,139 @@ impl SettingsView {
                     |settings, provider| settings.info_provider = provider,
                     cx,
                 );
+                let lowest = self.dropdown(
+                    "tempo-min",
+                    self.settings.tempo_min_bpm,
+                    &settings::MIN_BPM_CHOICES,
+                    settings::bpm_label,
+                    |settings, bpm| settings.tempo_min_bpm = bpm,
+                    cx,
+                );
+                let highest = self.dropdown(
+                    "tempo-max",
+                    self.settings.tempo_max_bpm,
+                    &settings::MAX_BPM_CHOICES,
+                    settings::bpm_label,
+                    |settings, bpm| settings.tempo_max_bpm = bpm,
+                    cx,
+                );
+                let decimals = self.dropdown(
+                    "bpm-decimals",
+                    self.settings.bpm_decimals,
+                    &settings::BPM_DECIMAL_CHOICES,
+                    settings::bpm_decimals_label,
+                    |settings, decimals| settings.bpm_decimals = decimals,
+                    cx,
+                );
+                let keep_tempo = Switch::new("keep-tagged-tempo")
+                    .checked(self.settings.keep_tagged_tempo)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        let checked = *checked;
+                        this.change(|settings| settings.keep_tagged_tempo = checked, cx);
+                    }));
+                let keep_key = Switch::new("keep-tagged-key")
+                    .checked(self.settings.keep_tagged_key)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        let checked = *checked;
+                        this.change(|settings| settings.keep_tagged_key = checked, cx);
+                    }));
+                let analysis = self.section(
+                    "Analysis",
+                    vec![
+                        self.row(
+                            "Lowest tempo",
+                            "Tracks are given a tempo between the lowest and the highest. A beat at 70 BPM is also a beat at 140, and this range decides which one a track gets. If you change it, the whole library is analysed again.",
+                            lowest,
+                            cx,
+                        ),
+                        self.row(
+                            "Highest tempo",
+                            "The top of the tempo range. If you change it, the whole library is analysed again.",
+                            highest,
+                            cx,
+                        ),
+                        self.row(
+                            "Show tempos with",
+                            "Decimal places for tempos in lists and the info panel. The measured tempo and the beat grid stay exact.",
+                            decimals,
+                            cx,
+                        ),
+                        self.row(
+                            "Keep tempo from tags",
+                            "Show the tempo in a file's tags instead of the measured one, if the file has one. The beat grid still comes from the measurement.",
+                            keep_tempo,
+                            cx,
+                        ),
+                        self.row(
+                            "Keep key from tags",
+                            "Show the key in a file's tags instead of the detected one, if the file has one. A key that you type in is always kept.",
+                            keep_key,
+                            cx,
+                        ),
+                    ],
+                    cx,
+                );
+                let key_place = self.dropdown(
+                    "key-placement",
+                    self.settings.key_placement,
+                    &Placement::FOR_KEY,
+                    Placement::label,
+                    |settings, place| settings.key_placement = place,
+                    cx,
+                );
+                let energy_place = self.dropdown(
+                    "energy-placement",
+                    self.settings.energy_placement,
+                    &Placement::FOR_ENERGY,
+                    Placement::label,
+                    |settings, place| settings.energy_placement = place,
+                    cx,
+                );
+                let tags = self.section(
+                    "Tags",
+                    vec![
+                        self.row(
+                            "Write the key to",
+                            "Where Tag tools, Write BPM, key and energy puts the key, in Camelot notation such as 8A. Old keys it wrote there are replaced.",
+                            key_place,
+                            cx,
+                        ),
+                        self.row(
+                            "Write the energy to",
+                            "Where the energy level goes, written as Energy 7. Files have no field of their own for it.",
+                            energy_place,
+                            cx,
+                        ),
+                    ],
+                    cx,
+                );
+                let key_box = |slot: usize| {
+                    div()
+                        .w(px(260.))
+                        .children(self.key_inputs.as_ref().map(|inputs| Input::new(&inputs[slot])))
+                };
                 let music_info = self.section(
                     "Music info",
-                    vec![self.row(
-                        "Look up tracks with",
-                        "The online database searched when you press Look up on a track. MusicBrainz covers more releases; the iTunes Store gives cleaner albums and a genre.",
-                        provider,
-                        cx,
-                    )],
+                    vec![
+                        self.row(
+                            "Look up tracks with",
+                            "The online database Look up searches first. MusicBrainz covers more releases; the iTunes Store gives cleaner albums and a genre; Discogs is strong on vinyl and club styles. You can switch in the Look up window.",
+                            provider,
+                            cx,
+                        ),
+                        self.row(
+                            "AcoustID key",
+                            "Identifies a track by its sound when its tags are wrong or missing. Get a free application key at acoustid.org/new-application and paste it here.",
+                            key_box(0),
+                            cx,
+                        ),
+                        self.row(
+                            "Discogs token",
+                            "Lets Look up search Discogs. Make a personal access token at discogs.com/settings/developers and paste it here. It is stored in djcraft's settings file.",
+                            key_box(1),
+                            cx,
+                        ),
+                    ],
                     cx,
                 );
                 vec![self.section(
@@ -339,6 +511,12 @@ impl SettingsView {
                             cx,
                         ),
                         self.row(
+                            "Watch folders for changes",
+                            "Add, update and remove tracks as files change while djcraft is open.",
+                            watch,
+                            cx,
+                        ),
+                        self.row(
                             "Library location",
                             "Where the library database and settings are stored.",
                             self.info(data_dir().to_string_lossy().into_owned(), cx),
@@ -346,7 +524,7 @@ impl SettingsView {
                         ),
                     ],
                     cx,
-                ), music_info]
+                ), analysis, tags, music_info]
             }
             Page::Assistant => vec![self.section(
                 "Assistant",
@@ -403,7 +581,8 @@ impl SettingsView {
 impl EventEmitter<SettingsEvent> for SettingsView {}
 
 impl Render for SettingsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.make_key_inputs(window, cx);
         let page = self.page;
         let sections = self.page(cx);
         let sidebar = self.sidebar(cx).into_any_element();

@@ -1,15 +1,17 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::f32::consts::TAU;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
-use djcraft_library::lookup::{self, Provider, TrackMatch};
+use djcraft_analysis::TempoRange;
+use djcraft_library::lookup::Provider;
 use djcraft_library::{
-    Camelot, ImportSummary, Library, Playlist, Source, SourceKind, Track, TrackEdit, TrackQuery,
-    read_artwork, read_playlists,
+    AlignOptions, ApplySummary, Camelot, Cleanup, FolderWatcher, Group, GroupCount, ImportSummary,
+    Library, PlannedChange, Playlist, PlaylistFolder, Source, SourceKind, TempoResult, Track,
+    TrackEdit, TrackQuery, read_artwork, read_playlists,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -24,10 +26,24 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::lookup_view::{LookupEvent, LookupField, LookupView};
+use crate::organise_view::{DuplicatesView, NameForm, OrganiseEvent, RelocateView, SmartForm};
+use crate::tag_tools::{FormEvent, RenameForm, ReplaceForm, ReviewEvent, ReviewView};
+
 /// How often the track list is refreshed while a scan is running.
 const SCAN_REFRESH: Duration = Duration::from_millis(400);
 /// How often it is refreshed while tracks are being analysed.
 const ANALYSIS_REFRESH: Duration = Duration::from_secs(2);
+/// What a menu entry does to the library view.
+type MenuAction = Box<dyn Fn(&mut LibraryView, &mut Window, &mut Context<LibraryView>)>;
+
+/// How many suggestions for the next track are listed.
+const SUGGESTIONS: usize = 50;
+/// How often watched folders are asked whether they changed.
+const WATCH_POLL: Duration = Duration::from_secs(1);
+/// How long a folder must be left alone before it is scanned, so that a
+/// copy in progress is scanned once, at its end.
+const WATCH_QUIET: Duration = Duration::from_secs(2);
 
 /// A section of the library, chosen from the rail on the left.
 #[derive(Clone, Copy, PartialEq)]
@@ -122,6 +138,13 @@ impl EditField {
 }
 
 /// A tempo without needless decimals: 128, 127.5.
+/// How many decimals tempos are shown with, from the settings.
+pub fn bpm_decimals(cx: &App) -> u8 {
+    cx.try_global::<crate::settings::Settings>()
+        .map_or(1, |settings| settings.bpm_decimals)
+}
+
+/// A tempo for an edit box: as precise as it is, without trailing zeros.
 fn format_bpm(bpm: f64) -> String {
     let text = format!("{bpm:.2}");
     text.trim_end_matches('0').trim_end_matches('.').to_string()
@@ -136,11 +159,12 @@ enum Field {
     Bpm,
     Key,
     Energy,
+    Year,
     Time,
     Source,
 }
 
-const COLUMNS: [(Field, &str, f32); 9] = [
+const COLUMNS: [(Field, &str, f32); 10] = [
     (Field::Title, "Title", 260.),
     (Field::Artist, "Artist", 170.),
     (Field::Album, "Album", 170.),
@@ -148,6 +172,7 @@ const COLUMNS: [(Field, &str, f32); 9] = [
     (Field::Bpm, "BPM", 70.),
     (Field::Key, "Key", 60.),
     (Field::Energy, "Energy", 80.),
+    (Field::Year, "Year", 60.),
     (Field::Time, "Time", 70.),
     (Field::Source, "Source", 110.),
 ];
@@ -163,6 +188,11 @@ pub enum LibraryEvent {
     },
     /// A track was picked out in one of the compact browsers.
     Selected { id: i64 },
+    /// A scan or analysis moved on, so the database may hold different
+    /// tracks, or new results for them.
+    Changed,
+    /// The user chose which columns to hide in track lists.
+    Columns(Vec<String>),
 }
 
 /// A track being dragged out of a track list.
@@ -312,6 +342,13 @@ struct TrackTable {
     playlists: Vec<Playlist>,
     /// The playlist being shown, if any.
     playlist: Option<i64>,
+    /// Whether it is a smart playlist, whose order cannot be changed.
+    smart: bool,
+    /// Rows come in an order of their own (best suggestions first), kept
+    /// unless the user sorts.
+    keep_order: bool,
+    /// The columns shown, as places in [`COLUMNS`].
+    visible: Vec<usize>,
 }
 
 impl TrackTable {
@@ -322,7 +359,15 @@ impl TrackTable {
             sort: None,
             playlists: Vec::new(),
             playlist: None,
+            smart: false,
+            keep_order: false,
+            visible: (0..COLUMNS.len()).collect(),
         }
+    }
+
+    /// The field shown in a column of the table as it is now.
+    fn field(&self, col_ix: usize) -> Field {
+        COLUMNS[self.visible[col_ix]].0
     }
 
     /// Replaces the rows, keeping the user's chosen sort order.
@@ -342,7 +387,7 @@ impl TrackTable {
 
     fn apply_sort(&mut self) {
         // An unsorted playlist stays in playlist order.
-        if self.playlist.is_some() && !self.sorted_by_user() {
+        if (self.playlist.is_some() || self.keep_order) && !self.sorted_by_user() {
             return;
         }
         let text = |a: &str, b: &str| a.to_lowercase().cmp(&b.to_lowercase());
@@ -354,8 +399,8 @@ impl TrackTable {
             (None, None) => Ordering::Equal,
         };
         let (field, descending) = match self.sort {
-            Some((column, ColumnSort::Ascending)) => (COLUMNS[column].0, false),
-            Some((column, ColumnSort::Descending)) => (COLUMNS[column].0, true),
+            Some((column, ColumnSort::Ascending)) => (self.field(column), false),
+            Some((column, ColumnSort::Descending)) => (self.field(column), true),
             _ => (Field::Artist, false),
         };
         self.tracks.sort_by(|a, b| {
@@ -366,6 +411,7 @@ impl TrackTable {
                 Field::Genre => text(&a.genre, &b.genre),
                 Field::Bpm => optional(a.bpm, b.bpm),
                 Field::Energy => optional(a.energy.map(f64::from), b.energy.map(f64::from)),
+                Field::Year => optional(a.year.map(f64::from), b.year.map(f64::from)),
                 // Everything is local for now, so fall back to the folder.
                 Field::Source => text(&a.source_name, &b.source_name),
                 // Wheel order, with keys that could not be read last.
@@ -388,7 +434,7 @@ impl TrackTable {
 
 impl TableDelegate for TrackTable {
     fn columns_count(&self, _: &App) -> usize {
-        COLUMNS.len()
+        self.visible.len()
     }
 
     fn rows_count(&self, _: &App) -> usize {
@@ -396,10 +442,10 @@ impl TableDelegate for TrackTable {
     }
 
     fn column(&self, col_ix: usize, _: &App) -> Column {
-        let (field, name, width) = COLUMNS[col_ix];
+        let (field, name, width) = COLUMNS[self.visible[col_ix]];
         let column = Column::new(name, name).width(px(width)).sortable();
         match field {
-            Field::Bpm | Field::Energy | Field::Time => column.text_right(),
+            Field::Bpm | Field::Energy | Field::Year | Field::Time => column.text_right(),
             _ => column,
         }
     }
@@ -447,17 +493,39 @@ impl TableDelegate for TrackTable {
         let mut menu = menu
             .item(item("Load to Deck 1".into(), LibraryView::load_to_deck, 0))
             .item(item("Load to Deck 2".into(), LibraryView::load_to_deck, 1));
-        if let Some(playlist) = self.playlist {
+        if track.missing {
+            menu = menu
+                .separator()
+                .item(item("Locate file…".into(), LibraryView::locate_file, 0));
+        }
+        if let Some(playlist) = self.playlist.filter(|_| !self.smart) {
+            // Moving rows only makes sense in the playlist's own order.
+            if !self.sorted_by_user() {
+                let last = self.tracks.len() as i64 - 1;
+                let at = row_ix as i64;
+                menu = menu.separator();
+                if at > 0 {
+                    menu = menu
+                        .item(item("Move to top".into(), LibraryView::move_track, 0))
+                        .item(item("Move up".into(), LibraryView::move_track, at - 1));
+                }
+                if at < last {
+                    menu = menu
+                        .item(item("Move down".into(), LibraryView::move_track, at + 1))
+                        .item(item("Move to bottom".into(), LibraryView::move_track, last));
+                }
+            }
             menu = menu.separator().item(item(
                 "Remove from playlist".into(),
                 LibraryView::remove_from_playlist,
                 playlist,
             ));
         }
+        // A smart playlist fills itself, so tracks cannot be added by hand.
         let others: Vec<_> = self
             .playlists
             .iter()
-            .filter(|playlist| Some(playlist.id) != self.playlist)
+            .filter(|playlist| Some(playlist.id) != self.playlist && playlist.rules.is_none())
             .collect();
         if !others.is_empty() {
             menu = menu.separator().label("Add to playlist");
@@ -497,10 +565,11 @@ impl TableDelegate for TrackTable {
         row_ix: usize,
         col_ix: usize,
         _: &mut Window,
-        _: &mut Context<TableState<Self>>,
+        cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let track = &self.tracks[row_ix];
-        let text: SharedString = match COLUMNS[col_ix].0 {
+        let decimals = bpm_decimals(cx);
+        let text: SharedString = match self.field(col_ix) {
             Field::Title => track.title.clone().into(),
             Field::Artist => track.artist.clone().into(),
             Field::Album => track.album.clone().into(),
@@ -516,7 +585,7 @@ impl TableDelegate for TrackTable {
                 .into(),
             Field::Bpm => track
                 .bpm
-                .map(|bpm| format!("{bpm:.1}"))
+                .map(|bpm| crate::settings::format_bpm(bpm, decimals))
                 .unwrap_or_default()
                 .into(),
             // Camelot notation when the tag can be understood, else as tagged.
@@ -524,12 +593,26 @@ impl TableDelegate for TrackTable {
                 Some(key) => key.to_string().into(),
                 None => track.key.clone().unwrap_or_default().into(),
             },
+            Field::Year => track
+                .year
+                .map(|year| year.to_string())
+                .unwrap_or_default()
+                .into(),
             Field::Time => {
                 let seconds = track.duration_seconds.round() as u64;
                 format!("{}:{:02}", seconds / 60, seconds % 60).into()
             }
         };
-        div().truncate().child(text)
+        // A track whose file is missing is shown faded, with a mark.
+        let missing = track.missing;
+        let text: SharedString = match self.field(col_ix) {
+            Field::Title if missing => format!("⚠ {text}").into(),
+            _ => text,
+        };
+        div()
+            .truncate()
+            .when(missing, |this| this.opacity(0.5))
+            .child(text)
     }
 }
 
@@ -572,13 +655,30 @@ pub struct LibraryView {
     /// One text box per [`EditField`], in that order.
     fields: [Entity<InputState>; 6],
     artwork: Option<Arc<Image>>,
-    matches: Vec<TrackMatch>,
-    looking_up: bool,
     provider: Provider,
     /// Whether the info panel's details can be changed. Off until asked.
     editing: bool,
     running_scans: usize,
     scan_counters: Arc<ScanCounters>,
+    /// Watches the folders for changes; `None` when that is switched off.
+    watcher: Option<FolderWatcher>,
+    /// The tempo range tracks are analysed with.
+    tempo_range: TempoRange,
+    /// Set when the library must be analysed again once the pass under way
+    /// has stopped.
+    reanalyse: bool,
+    /// The automatic group shown, in place of a source.
+    group: Option<Group>,
+    groups: Vec<GroupCount>,
+    folders: Vec<PlaylistFolder>,
+    /// Playlist folders shown closed.
+    collapsed: HashSet<i64>,
+    /// In the browser under the decks: the track on the decks that
+    /// suggestions are for, and whether they are being shown.
+    reference: Option<(i64, SharedString)>,
+    suggesting: bool,
+    /// The duplicates dialog, while it is open, to refresh after a merge.
+    duplicates: Option<Entity<DuplicatesView>>,
     /// The key picked on the Camelot wheel.
     wheel_key: Option<Camelot>,
     key_counts: HashMap<Camelot, usize>,
@@ -676,18 +776,35 @@ impl LibraryView {
             inspected: None,
             fields,
             artwork: None,
-            matches: Vec::new(),
-            looking_up: false,
             provider: Provider::default(),
             editing: false,
             running_scans: 0,
             scan_counters: Arc::default(),
+            watcher: None,
+            tempo_range: TempoRange::default(),
+            reanalyse: false,
+            group: None,
+            groups: Vec::new(),
+            folders: Vec::new(),
+            collapsed: HashSet::new(),
+            reference: None,
+            suggesting: false,
+            duplicates: None,
             flow: (!compact).then(|| cx.new(|cx| crate::flow_view::FlowView::new(window, cx))),
             wheel_key: None,
             key_counts: HashMap::new(),
             analysing: false,
             analysis: Arc::default(),
         };
+        if !compact && let Some(settings) = cx.try_global::<crate::settings::Settings>().cloned() {
+            view.tempo_range = settings.tempo_range();
+            // The database holds this too, for every connection to see.
+            if let Some(library) = &view.library
+                && let Err(error) = library.set_keep_tagged(settings.keep_tagged())
+            {
+                view.error = Some(error.to_string().into());
+            }
+        }
         view.show_section(Section::Library, cx);
         // Pick up anything that changed on disk since the last run.
         // The Library tab does this; the browser shares its database.
@@ -700,7 +817,100 @@ impl LibraryView {
             view.scan(source.id, cx);
         }
         view.analyse(cx);
+        if !compact {
+            view.poll_watcher(cx);
+        }
         view
+    }
+
+    /// Follows a change to the settings that affect the library: how
+    /// tracks are listed, and the tempo range they are analysed with.
+    pub fn apply_settings(&mut self, settings: &crate::settings::Settings, cx: &mut Context<Self>) {
+        self.set_watching(settings.watch_folders);
+        if let Some(library) = &self.library
+            && library.keep_tagged().ok() != Some(settings.keep_tagged())
+            && let Err(error) = library.set_keep_tagged(settings.keep_tagged())
+        {
+            self.error = Some(error.to_string().into());
+        }
+        let range = settings.tempo_range();
+        if range != self.tempo_range {
+            self.tempo_range = range;
+            self.reanalyse(cx);
+        }
+        self.reload(cx);
+        cx.emit(LibraryEvent::Changed);
+    }
+
+    /// Analyses every track again. A pass under way is stopped first, since
+    /// it was started with the old settings.
+    fn reanalyse(&mut self, cx: &mut Context<Self>) {
+        if self.analysing {
+            self.reanalyse = true;
+            self.analysis.cancel.store(true, AtomicOrdering::Relaxed);
+            return;
+        }
+        if let Some(library) = &self.library
+            && let Err(error) = library.reset_analysis()
+        {
+            self.error = Some(error.to_string().into());
+        }
+        self.analyse(cx);
+    }
+
+    /// The beat grid of the library track at `path`, if it has one.
+    pub fn beat_grid_at(&self, path: &Path) -> Option<TempoResult> {
+        let library = self.library.as_ref()?;
+        let id = library.track_at(path).ok()??;
+        library.beat_grid(id).ok()?
+    }
+
+    /// Starts or stops watching the library's folders for changes.
+    pub fn set_watching(&mut self, on: bool) {
+        if on == self.watcher.is_some() {
+            return;
+        }
+        self.watcher = on.then(FolderWatcher::new);
+        for source in self.sources.clone() {
+            self.watch(&source);
+        }
+    }
+
+    fn watch(&mut self, source: &Source) {
+        let Some(watcher) = &mut self.watcher else {
+            return;
+        };
+        if source.kind == SourceKind::Folder {
+            // A folder that cannot be watched (an unplugged drive, say) is
+            // still scanned at start-up.
+            let _ = watcher.watch(source.id, Path::new(&source.location));
+        }
+    }
+
+    /// Scans watched folders once changes to them have settled, for as
+    /// long as the view lives.
+    fn poll_watcher(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(WATCH_POLL).await;
+                let alive = this.update(cx, |this, cx| {
+                    // Changes during a scan wait for it to finish.
+                    let changed = match &this.watcher {
+                        Some(watcher) if this.running_scans == 0 => {
+                            watcher.take_changed(WATCH_QUIET)
+                        }
+                        _ => Vec::new(),
+                    };
+                    for source_id in changed {
+                        this.scan(source_id, cx);
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Analyses tracks that have not been analysed yet, in the background,
@@ -712,12 +922,22 @@ impl LibraryView {
         self.analysing = true;
         let db_path = self.db_path.clone();
         let progress = self.analysis.clone();
-        let work = cx
-            .background_spawn(async move { crate::analysis::analyse_pending(&db_path, &progress) });
+        let range = self.tempo_range;
+        let work = cx.background_spawn(async move {
+            let waveforms = crate::settings::waveform_dir();
+            crate::analysis::analyse_pending(&db_path, &waveforms, range, &progress)
+        });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             this.update(cx, |this, cx| {
                 this.analysing = false;
+                cx.emit(LibraryEvent::Changed);
+                if std::mem::take(&mut this.reanalyse) {
+                    this.analysis.cancel.store(false, AtomicOrdering::Relaxed);
+                    this.reanalyse(cx);
+                    this.reload(cx);
+                    return;
+                }
                 let analysed_some = this.analysis.total.load(AtomicOrdering::Relaxed) > 0;
                 match result {
                     // Tracks may have been added while this pass was busy;
@@ -736,6 +956,7 @@ impl LibraryView {
                 cx.background_executor().timer(ANALYSIS_REFRESH).await;
                 let analysing = this.update(cx, |this, cx| {
                     this.reload(cx);
+                    cx.emit(LibraryEvent::Changed);
                     this.analysing
                 });
                 if !analysing.unwrap_or(false) {
@@ -764,24 +985,49 @@ impl LibraryView {
                 .filter(|_| self.section == Section::Library || self.compact)
                 .map(|key| key.compatible().to_vec())
                 .unwrap_or_default(),
+            group: self
+                .group
+                .clone()
+                .filter(|_| !in_playlists && !self.compact),
         };
+        let suggest_for = self
+            .reference
+            .as_ref()
+            .map(|(id, _)| *id)
+            .filter(|_| self.compact && self.suggesting);
         let loaded = (|| {
-            let tracks = if in_playlists && query.playlist.is_none() {
+            let tracks = if let Some(reference) = suggest_for {
+                library
+                    .suggest_next(reference, SUGGESTIONS)?
+                    .into_iter()
+                    .map(|suggestion| suggestion.track)
+                    .collect()
+            } else if in_playlists && query.playlist.is_none() {
                 Vec::new()
             } else {
                 library.tracks(&query)?
             };
             self.key_counts = library.key_counts()?;
+            if !self.compact {
+                self.groups = library.groups()?;
+                self.folders = library.folders()?;
+            }
             Ok::<_, djcraft_library::Error>((library.sources()?, library.playlists()?, tracks))
         })();
         match loaded {
             Ok((sources, playlists, tracks)) => {
                 self.sources = sources;
                 self.playlists = playlists.clone();
+                let smart = query
+                    .playlist
+                    .and_then(|id| playlists.iter().find(|p| p.id == id))
+                    .is_some_and(|playlist| playlist.rules.is_some());
                 self.table.update(cx, |table, cx| {
-                    table
-                        .delegate_mut()
-                        .set_tracks(tracks, playlists, query.playlist);
+                    let table = table.delegate_mut();
+                    table.smart = smart;
+                    // Suggestions come best first; a sort would hide that.
+                    table.keep_order = suggest_for.is_some();
+                    table.set_tracks(tracks, playlists, query.playlist);
                     cx.notify();
                 });
             }
@@ -889,7 +1135,6 @@ impl LibraryView {
         ] {
             self.set_field(field, text, window, cx);
         }
-        self.matches.clear();
         self.artwork = None;
         self.notice = None;
         self.editing = false;
@@ -920,7 +1165,7 @@ impl LibraryView {
         cx.notify();
     }
 
-    /// Writes the info panel's values to the file's tags and the library.
+    /// Shows what Save would write to the file, for the user to confirm.
     fn save_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(track), Some(library)) = (&self.inspected, &self.library) else {
             return;
@@ -943,26 +1188,306 @@ impl LibraryView {
             genre: self.field_text(EditField::Genre, cx),
             bpm,
             key: Some(self.field_text(EditField::Key, cx)).filter(|key| !key.is_empty()),
+            comment: None,
+            grouping: None,
         };
-        match library.edit_track(id, &edit) {
-            Ok(()) => {
-                self.error = None;
-                self.reload(cx);
-                let saved = self
-                    .table
-                    .read(cx)
-                    .delegate()
-                    .tracks
-                    .iter()
-                    .find(|t| t.id == id);
-                if let Some(saved) = saved.cloned() {
-                    self.inspect(saved, window, cx);
-                }
-                self.notice = Some("Saved to the file's tags.".into());
+        match library.plan_edit(id, &edit) {
+            Ok(change) if change.is_empty() => {
+                self.editing = false;
+                self.notice = Some("Nothing to save: the file already says this.".into());
             }
+            Ok(change) => self.review("Edit track details".into(), vec![change], window, cx),
             Err(error) => self.error = Some(error.to_string().into()),
         }
         cx.notify();
+    }
+
+    /// The tracks a tag tool works on: those in the list as it is shown.
+    fn listed_ids(&self, cx: &App) -> Vec<i64> {
+        self.table
+            .read(cx)
+            .delegate()
+            .tracks
+            .iter()
+            .map(|track| track.id)
+            .collect()
+    }
+
+    /// Plans a tag tool's changes for the listed tracks and shows them.
+    fn run_tool(
+        &mut self,
+        label: &str,
+        plan: impl FnOnce(&Library, &[i64]) -> djcraft_library::Result<Vec<PlannedChange>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ids = self.listed_ids(cx);
+        let Some(library) = &self.library else {
+            return;
+        };
+        match plan(library, &ids) {
+            Ok(changes) if changes.is_empty() => {
+                self.notice = Some(format!("{label}: nothing to change.").into());
+            }
+            Ok(changes) => self.review(label.to_string(), changes, window, cx),
+            Err(error) => self.error = Some(error.to_string().into()),
+        }
+        cx.notify();
+    }
+
+    /// Opens the review of planned changes; confirming it writes them.
+    fn review(
+        &mut self,
+        label: String,
+        changes: Vec<PlannedChange>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let count = changes.len();
+        let review = cx.new(|_| ReviewView::new(label.clone(), changes));
+        cx.subscribe_in(
+            &review,
+            window,
+            |this, _, event: &ReviewEvent, window, cx| {
+                if let ReviewEvent::Apply(label, changes) = event {
+                    this.write_changes(label.clone(), changes.clone(), window, cx);
+                }
+                window.close_dialog(cx);
+            },
+        )
+        .detach();
+        let title = format!(
+            "{label}: review {count} file{}",
+            if count == 1 { "" } else { "s" }
+        );
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title(title.clone())
+                .w(px(760.))
+                .child(review.clone())
+        });
+    }
+
+    /// Writes reviewed changes on a background thread, then shows the
+    /// result.
+    fn write_changes(
+        &mut self,
+        label: String,
+        changes: Vec<PlannedChange>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let db_path = self.db_path.clone();
+        let work =
+            cx.background_spawn(
+                async move { Library::open(&db_path)?.apply_changes(&label, &changes) },
+            );
+        self.notice = Some("Writing tags…".into());
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = work.await;
+            this.update_in(cx, |this, window, cx| {
+                this.written(result, "Wrote", window, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Undoes the most recent batch of tag changes.
+    fn undo_last(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(batch) = self
+            .library
+            .as_ref()
+            .and_then(|library| library.last_batch().ok().flatten())
+        else {
+            self.notice = Some("There is nothing to undo.".into());
+            cx.notify();
+            return;
+        };
+        let db_path = self.db_path.clone();
+        let work =
+            cx.background_spawn(async move { Library::open(&db_path)?.undo_batch(batch.id) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = work.await;
+            this.update_in(cx, |this, window, cx| {
+                this.written(result, "Undid", window, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Reports how writing or undoing went, and shows the new tags.
+    fn written(
+        &mut self,
+        result: djcraft_library::Result<ApplySummary>,
+        verb: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let notice = match result {
+            Ok(summary) => {
+                let files = |count: usize| match count {
+                    1 => "1 file".to_string(),
+                    count => format!("{count} files"),
+                };
+                let mut notice = format!("{verb} {}.", files(summary.written));
+                if let Some((path, why)) = summary.skipped.first() {
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    notice.push_str(&format!(
+                        " Skipped {}: {name}, because {why}.",
+                        files(summary.skipped.len())
+                    ));
+                }
+                self.error = None;
+                Some(notice)
+            }
+            Err(error) => {
+                self.error = Some(error.to_string().into());
+                None
+            }
+        };
+        self.editing = false;
+        self.reload(cx);
+        // The info panel shows the track as its file now is.
+        if let Some(id) = self.inspected.as_ref().map(|track| track.id) {
+            let fresh = self.library.as_ref().and_then(|library| {
+                let query = TrackQuery {
+                    id: Some(id),
+                    ..Default::default()
+                };
+                library.tracks(&query).ok()?.pop()
+            });
+            match fresh {
+                Some(track) => self.inspect(track, window, cx),
+                None => self.inspected = None,
+            }
+        }
+        // Set last, as opening the track again clears it.
+        self.notice = notice.map(Into::into);
+        cx.emit(LibraryEvent::Changed);
+        cx.notify();
+    }
+
+    /// Opens a form that sets up a tag tool, and then its review.
+    fn open_form<F: EventEmitter<FormEvent> + Render>(
+        &mut self,
+        title: &'static str,
+        form: Entity<F>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.subscribe_in(&form, window, |this, _, event: &FormEvent, window, cx| {
+            window.close_dialog(cx);
+            match event {
+                FormEvent::Replace(cleanup) => {
+                    let cleanup = cleanup.clone();
+                    this.run_tool(
+                        "Find and replace",
+                        |library, ids| library.plan_cleanup(ids, &cleanup),
+                        window,
+                        cx,
+                    );
+                }
+                FormEvent::Rename(template) => {
+                    let template = template.clone();
+                    this.run_tool(
+                        "Rename files",
+                        |library, ids| library.plan_rename(ids, &template),
+                        window,
+                        cx,
+                    );
+                }
+                FormEvent::Cancel => {}
+            }
+        })
+        .detach();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog.title(title).w(px(520.)).child(form.clone())
+        });
+    }
+
+    /// The Tag tools menu: changes to the tags of every track in the list.
+    fn tag_tools_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.weak_entity();
+        let undo = self
+            .library
+            .as_ref()
+            .and_then(|library| library.last_batch().ok().flatten())
+            .map(|batch| format!("Undo \"{}\" ({} files)", batch.label, batch.files));
+        Button::new("tag-tools")
+            .outline()
+            .icon(IconName::Tags)
+            .label("Tools")
+            .dropdown_caret(true)
+            .dropdown_menu(move |menu, _, _| {
+                let item = |label: String, run: fn(&mut LibraryView, &mut Window, &mut Context<LibraryView>)| {
+                    let view = view.clone();
+                    PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                        view.update(cx, |view, cx| run(view, window, cx)).ok();
+                    })
+                };
+                let mut menu = menu
+                    .label("Tags of every track in the list")
+                    .item(item("Write BPM, key and energy…".into(), |this, window, cx| {
+                        let settings = cx
+                            .try_global::<crate::settings::Settings>()
+                            .cloned()
+                            .unwrap_or_default();
+                        let options = AlignOptions {
+                            bpm: true,
+                            key: settings.key_placement,
+                            energy: settings.energy_placement,
+                        };
+                        this.run_tool(
+                            "Write BPM, key and energy",
+                            |library, ids| library.plan_align(ids, &options),
+                            window,
+                            cx,
+                        );
+                    }))
+                    .item(item("Find and replace…".into(), |this, window, cx| {
+                        let form = cx.new(|cx| ReplaceForm::new(window, cx));
+                        this.open_form("Find and replace", form, window, cx);
+                    }))
+                    .item(item("Remove extra spaces…".into(), |this, window, cx| {
+                        this.run_tool(
+                            "Remove extra spaces",
+                            |library, ids| library.plan_cleanup(ids, &Cleanup::ExtraSpaces),
+                            window,
+                            cx,
+                        );
+                    }))
+                    .item(item("Fix capitalisation…".into(), |this, window, cx| {
+                        this.run_tool(
+                            "Fix capitalisation",
+                            |library, ids| library.plan_cleanup(ids, &Cleanup::Capitalise),
+                            window,
+                            cx,
+                        );
+                    }))
+                    .item(item("Rename files from tags…".into(), |this, window, cx| {
+                        let form = cx.new(|cx| RenameForm::new(window, cx));
+                        this.open_form("Rename files from tags", form, window, cx);
+                    }));
+                if let Some(undo) = undo.clone() {
+                    menu = menu
+                        .separator()
+                        .item(item(undo, |this, window, cx| this.undo_last(window, cx)));
+                }
+                menu.separator()
+                    .label("Library")
+                    .item(item("Find duplicates…".into(), |this, window, cx| {
+                        this.find_duplicates(window, cx)
+                    }))
+                    .item(item("Find missing files in a folder…".into(), |this, window, cx| {
+                        this.find_moved(window, cx)
+                    }))
+            })
     }
 
     /// Chooses where "Look up" searches.
@@ -971,57 +1496,48 @@ impl LibraryView {
         cx.notify();
     }
 
-    /// Asks the chosen provider what the track in the info panel might be.
-    fn look_up(&mut self, cx: &mut Context<Self>) {
-        let (mut artist, mut title) = (
-            self.field_text(EditField::Artist, cx),
+    /// Opens the Look up popup for the track in the info panel, searching
+    /// with what the text boxes hold now.
+    fn open_lookup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = [
             self.field_text(EditField::Title, cx),
-        );
-        // Untagged files are often named "Artist - Title".
-        if artist.is_empty()
-            && let Some((left, right)) = title.clone().split_once(" - ")
-        {
-            (artist, title) = (left.trim().to_string(), right.trim().to_string());
-        }
+            self.field_text(EditField::Artist, cx),
+            self.field_text(EditField::Album, cx),
+            self.field_text(EditField::Genre, cx),
+        ];
         let provider = self.provider;
-        self.looking_up = true;
-        self.matches.clear();
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move { lookup::search(provider, &artist, &title) })
-                .await;
-            this.update(cx, |this, cx| {
-                this.looking_up = false;
-                match result {
-                    Ok(matches) => {
-                        this.error = None;
-                        this.notice = matches
-                            .is_empty()
-                            .then(|| format!("{} found no match.", provider.label()).into());
-                        this.matches = matches;
-                    }
-                    Err(error) => this.error = Some(error.to_string().into()),
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// Copies a lookup result into the text boxes. Nothing is saved yet.
-    fn apply_match(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(found) = self.matches.get(index).cloned() else {
+        let Some(path) = self.inspected.as_ref().map(|track| track.path.clone()) else {
             return;
         };
-        self.set_field(EditField::Title, &found.title, window, cx);
-        self.set_field(EditField::Artist, &found.artist, window, cx);
-        self.set_field(EditField::Album, &found.album, window, cx);
-        if let Some(genre) = &found.genre {
-            self.set_field(EditField::Genre, genre, window, cx);
-        }
-        cx.notify();
+        let lookup = cx.new(|cx| LookupView::new(current, provider, path, window, cx));
+        cx.subscribe_in(
+            &lookup,
+            window,
+            |this, _, event: &LookupEvent, window, cx| {
+                if let LookupEvent::Apply(values) = event {
+                    for (field, value) in values {
+                        let field = match field {
+                            LookupField::Title => EditField::Title,
+                            LookupField::Artist => EditField::Artist,
+                            LookupField::Album => EditField::Album,
+                            LookupField::Genre => EditField::Genre,
+                        };
+                        this.set_field(field, value, window, cx);
+                    }
+                    this.notice = (!values.is_empty())
+                        .then(|| "Details copied. Press Save to write them to the file.".into());
+                    cx.notify();
+                }
+                window.close_dialog(cx);
+            },
+        )
+        .detach();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("Look up track details")
+                .w(px(760.))
+                .child(lookup.clone())
+        });
     }
 
     /// Lists the other tracks on the inspected track's album.
@@ -1039,7 +1555,11 @@ impl LibraryView {
         let (border, muted, tile) = (theme.border, theme.muted_foreground, theme.secondary);
         let seconds = track.duration_seconds.round() as u64;
         let editing = self.editing;
-        let bpm = track.bpm.map(format_bpm).unwrap_or_default();
+        let decimals = bpm_decimals(cx);
+        let bpm = track
+            .bpm
+            .map(|bpm| crate::settings::format_bpm(bpm, decimals))
+            .unwrap_or_default();
         let labelled = |field: EditField| {
             let label = div().text_xs().text_color(muted).child(field.label());
             let column = div().flex().flex_col().gap_1().child(label);
@@ -1193,43 +1713,14 @@ impl LibraryView {
                             Button::new("look-up")
                                 .outline()
                                 .icon(IconName::Search)
-                                .label(if self.looking_up {
-                                    "Looking up…"
-                                } else {
-                                    "Look up"
-                                })
-                                .tooltip(format!("Search {} for this track", self.provider.label()))
-                                .disabled(self.looking_up)
-                                .on_click(cx.listener(|this, _, _, cx| this.look_up(cx))),
+                                .label("Look up…")
+                                .tooltip("Search an online database for this track's details")
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.open_lookup(window, cx)),
+                                ),
                         ),
                 )
             })
-            .children(self.matches.iter().enumerate().map(|(index, found)| {
-                let detail = [
-                    Some(found.album.clone()).filter(|album| !album.is_empty()),
-                    found.year.clone(),
-                    found.genre.clone(),
-                ]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(" · ");
-                div()
-                    .id(("match", index))
-                    .flex()
-                    .flex_col()
-                    .p_2()
-                    .border_1()
-                    .border_color(border)
-                    .rounded_md()
-                    .text_sm()
-                    .hover(|style| style.bg(tile))
-                    .child(format!("{} — {}", found.artist, found.title))
-                    .child(div().text_xs().text_color(muted).child(detail))
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.apply_match(index, window, cx)),
-                    )
-            }))
     }
 
     /// Gives a compact browser a button that pops up the Camelot wheel.
@@ -1253,7 +1744,385 @@ impl LibraryView {
     fn select(&mut self, source: Option<i64>, cx: &mut Context<Self>) {
         self.section = Section::Library;
         self.selected = source;
+        self.group = None;
         self.reload(cx);
+    }
+
+    fn select_group(&mut self, group: Group, cx: &mut Context<Self>) {
+        self.section = Section::Library;
+        self.selected = None;
+        self.group = Some(group);
+        self.reload(cx);
+    }
+
+    /// Sets the track on the decks that suggestions are for, for the
+    /// browser under the decks.
+    pub fn set_reference(
+        &mut self,
+        reference: Option<(i64, SharedString)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.reference != reference {
+            self.reference = reference;
+            if self.suggesting {
+                self.reload(cx);
+            }
+            cx.notify();
+        }
+    }
+
+    /// The library track at a path, with its title, if there is one.
+    pub fn track_at(&self, path: &Path) -> Option<(i64, SharedString)> {
+        let library = self.library.as_ref()?;
+        let id = library.track_at(path).ok()??;
+        let query = TrackQuery {
+            id: Some(id),
+            ..Default::default()
+        };
+        let track = library.tracks(&query).ok()?.pop()?;
+        Some((id, track.title.into()))
+    }
+
+    /// Shows only the columns not named in `hidden`.
+    pub fn set_hidden_columns(&mut self, hidden: &[String], cx: &mut Context<Self>) {
+        let visible: Vec<usize> = COLUMNS
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, name, _))| !hidden.iter().any(|h| h == name))
+            .map(|(index, _)| index)
+            .collect();
+        self.table.update(cx, |table, cx| {
+            if table.delegate().visible != visible {
+                let delegate = table.delegate_mut();
+                delegate.visible = visible;
+                delegate.sort = None;
+                table.refresh(cx);
+            }
+        });
+    }
+
+    /// A menu of columns to show or hide.
+    fn columns_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let visible = self.table.read(cx).delegate().visible.clone();
+        let view = cx.weak_entity();
+        Button::new("columns")
+            .ghost()
+            .small()
+            .icon(IconName::Columns3)
+            .tooltip("Columns")
+            .dropdown_menu(move |mut menu, _, _| {
+                // The title is always shown.
+                for (index, (_, name, _)) in COLUMNS.iter().enumerate().skip(1) {
+                    let shown = visible.contains(&index);
+                    let mut hidden: Vec<String> = COLUMNS
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| !visible.contains(i))
+                        .map(|(_, (_, name, _))| name.to_string())
+                        .collect();
+                    if shown {
+                        hidden.push(name.to_string());
+                    } else {
+                        hidden.retain(|h| h != name);
+                    }
+                    let view = view.clone();
+                    menu = menu.item(PopupMenuItem::new(*name).checked(shown).on_click(
+                        move |_, _, cx| {
+                            view.update(cx, |_, cx| cx.emit(LibraryEvent::Columns(hidden.clone())))
+                                .ok();
+                        },
+                    ));
+                }
+                menu
+            })
+    }
+
+    /// Opens a small dialog that asks for a name, then calls `done` with it.
+    fn ask_name(
+        &mut self,
+        title: &'static str,
+        initial: &str,
+        action: &'static str,
+        done: impl Fn(&mut Self, String, &mut Context<Self>) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let form = cx.new(|cx| NameForm::new(initial, action, window, cx));
+        cx.subscribe_in(
+            &form,
+            window,
+            move |this, _, event: &OrganiseEvent, window, cx| {
+                if let OrganiseEvent::Named(name) = event {
+                    done(this, name.clone(), cx);
+                }
+                window.close_dialog(cx);
+            },
+        )
+        .detach();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog.title(title).w(px(420.)).child(form.clone())
+        });
+    }
+
+    /// Runs a change to the library, showing any error, then reloads.
+    fn change_library(
+        &mut self,
+        change: impl FnOnce(&mut Library) -> djcraft_library::Result<()>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(library) = &mut self.library else {
+            return;
+        };
+        if let Err(error) = change(library) {
+            self.error = Some(error.to_string().into());
+        }
+        self.reload(cx);
+        cx.emit(LibraryEvent::Changed);
+    }
+
+    /// Opens the smart playlist editor, for a new one or to change one.
+    fn edit_smart(&mut self, playlist: Option<i64>, window: &mut Window, cx: &mut Context<Self>) {
+        let existing = playlist
+            .and_then(|id| self.playlists.iter().find(|p| p.id == id))
+            .cloned();
+        let name = existing
+            .as_ref()
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        let rules = existing.as_ref().and_then(|p| p.rules.clone());
+        let form = cx.new(|cx| SmartForm::new(&name, rules.as_ref(), window, cx));
+        cx.subscribe_in(
+            &form,
+            window,
+            move |this, _, event: &OrganiseEvent, window, cx| {
+                if let OrganiseEvent::Smart(name, rules) = event {
+                    let (name, rules) = (name.clone(), rules.clone());
+                    let mut created = None;
+                    this.change_library(
+                        |library| {
+                            match playlist {
+                                Some(id) => {
+                                    library.rename_playlist(id, &name)?;
+                                    library.set_playlist_rules(id, &rules)?;
+                                }
+                                None => {
+                                    created = Some(library.create_smart_playlist(&name, &rules)?.id)
+                                }
+                            }
+                            Ok(())
+                        },
+                        cx,
+                    );
+                    if let Some(id) = created.or(playlist) {
+                        this.open_playlist(id, cx);
+                    }
+                }
+                window.close_dialog(cx);
+            },
+        )
+        .detach();
+        let title = if playlist.is_some() {
+            "Edit smart playlist"
+        } else {
+            "New smart playlist"
+        };
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog.title(title).w(px(680.)).child(form.clone())
+        });
+    }
+
+    /// Lists duplicate tracks for the user to choose which copy to keep.
+    fn find_duplicates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(library) = &self.library else {
+            return;
+        };
+        let groups = match library.duplicate_groups() {
+            Ok(groups) => groups,
+            Err(error) => {
+                self.error = Some(error.to_string().into());
+                cx.notify();
+                return;
+            }
+        };
+        let view = cx.new(|_| DuplicatesView::new(groups));
+        self.duplicates = Some(view.clone());
+        cx.subscribe_in(
+            &view,
+            window,
+            |this, view, event: &OrganiseEvent, window, cx| match event {
+                OrganiseEvent::Merge(keep, others) => {
+                    let (keep, others) = (*keep, others.clone());
+                    this.change_library(|library| library.merge_duplicates(keep, &others), cx);
+                    let groups = this
+                        .library
+                        .as_ref()
+                        .and_then(|library| library.duplicate_groups().ok())
+                        .unwrap_or_default();
+                    view.update(cx, |view, cx| view.set_groups(groups, cx));
+                }
+                _ => {
+                    this.duplicates = None;
+                    window.close_dialog(cx);
+                }
+            },
+        )
+        .detach();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog.title("Duplicates").w(px(820.)).child(view.clone())
+        });
+    }
+
+    /// Asks for a folder, looks there for the files of missing tracks, and
+    /// offers to relink those it finds.
+    fn find_moved(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let folder = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Search here".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(folder))) = folder.await else {
+                return;
+            };
+            let Some(folder) = folder.into_iter().next() else {
+                return;
+            };
+            this.update_in(cx, |this, window, cx| {
+                let Some(library) = &this.library else {
+                    return;
+                };
+                match library.find_moved(&folder) {
+                    Ok(found) if found.is_empty() => {
+                        this.notice = Some("None of the missing files are in that folder.".into());
+                        cx.notify();
+                    }
+                    Ok(found) => this.confirm_relocate(found, window, cx),
+                    Err(error) => {
+                        this.error = Some(error.to_string().into());
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn confirm_relocate(
+        &mut self,
+        found: Vec<(Track, PathBuf)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.new(|_| RelocateView::new(found));
+        cx.subscribe_in(
+            &view,
+            window,
+            |this, _, event: &OrganiseEvent, window, cx| {
+                if let OrganiseEvent::Relocate(moves) = event {
+                    let moves = moves.clone();
+                    let count = moves.len();
+                    this.change_library(
+                        |library| {
+                            for (id, path) in &moves {
+                                library.relocate(*id, path)?;
+                            }
+                            Ok(())
+                        },
+                        cx,
+                    );
+                    this.notice = Some(format!("Relinked {count} tracks.").into());
+                }
+                window.close_dialog(cx);
+            },
+        )
+        .detach();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("Missing files found")
+                .w(px(760.))
+                .child(view.clone())
+        });
+    }
+
+    /// Asks for the file of one missing track and relinks it.
+    fn locate_file(&mut self, track: i64, _: i64, cx: &mut Context<Self>) {
+        let file = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Use this file".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(file))) = file.await else {
+                return;
+            };
+            let Some(file) = file.into_iter().next() else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.change_library(|library| library.relocate(track, &file), cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Takes every missing track out of the library, after asking.
+    fn remove_missing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self
+            .groups
+            .iter()
+            .find(|group| group.group == Group::Missing)
+            .map_or(0, |group| group.count);
+        let view = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let view = view.clone();
+            dialog
+                .title("Remove missing tracks?")
+                .w(px(460.))
+                .child(div().text_sm().child(format!(
+                    "{count} tracks whose files are missing will leave the library, with their places in playlists and their cue points. No file is touched."
+                )))
+                .footer(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("keep-missing")
+                                .outline()
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("remove-missing")
+                                .danger()
+                                .label(format!("Remove {count} tracks"))
+                                .on_click(move |_, window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.change_library(|library| library.remove_missing().map(|_| ()), cx);
+                                        view.group = None;
+                                        view.reload(cx);
+                                    })
+                                    .ok();
+                                    window.close_dialog(cx);
+                                }),
+                        ),
+                )
+        });
+    }
+
+    /// Moves a track within the open playlist, to `to`.
+    fn move_track(&mut self, track: i64, to: i64, cx: &mut Context<Self>) {
+        let Some(playlist) = self.playlist else {
+            return;
+        };
+        self.change_library(
+            |library| library.move_in_playlist(playlist, track, to.max(0) as usize),
+            cx,
+        );
     }
 
     fn open_playlist(&mut self, playlist: i64, cx: &mut Context<Self>) {
@@ -1318,7 +2187,10 @@ impl LibraryView {
                         return;
                     };
                     match library.add_folder(&path) {
-                        Ok(source) => this.scan(source.id, cx),
+                        Ok(source) => {
+                            this.watch(&source);
+                            this.scan(source.id, cx);
+                        }
                         Err(error) => this.error = Some(error.to_string().into()),
                     }
                 }
@@ -1335,6 +2207,9 @@ impl LibraryView {
         };
         if let Err(error) = library.remove_source(id) {
             self.error = Some(error.to_string().into());
+        }
+        if let Some(watcher) = &mut self.watcher {
+            watcher.unwatch(id);
         }
         if self.selected == Some(id) {
             self.selected = None;
@@ -1366,6 +2241,10 @@ impl LibraryView {
                     this.error = Some(error.to_string().into());
                 }
                 this.reload(cx);
+                cx.emit(LibraryEvent::Changed);
+                if let (Section::Flow, Some(flow)) = (this.section, &this.flow) {
+                    flow.update(cx, |flow, cx| flow.refresh(cx));
+                }
                 // Whatever the scan found needs analysing.
                 if this.running_scans == 0 {
                     this.analyse(cx);
@@ -1562,7 +2441,9 @@ impl LibraryView {
                 .px_2()
                 .rounded_md()
                 .text_sm()
-                .when(self.selected == source, |this| this.bg(hover))
+                .when(self.selected == source && self.group.is_none(), |this| {
+                    this.bg(hover)
+                })
                 .hover(|style| style.bg(hover))
                 .child(Icon::new(icon).small().text_color(muted))
                 .child(div().flex_1().min_w_0().truncate().child(label))
@@ -1649,6 +2530,56 @@ impl LibraryView {
                         .on_click(cx.listener(move |this, _, _, cx| this.open_playlist(id, cx)))
                 }))
             })
+            .when(!self.compact && !self.groups.is_empty(), |this| {
+                this.child(
+                    div()
+                        .px_2()
+                        .pt_2()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("Groups"),
+                )
+                .children(self.groups.iter().enumerate().map(|(index, group)| {
+                    let chosen = group.group.clone();
+                    let selected = self.group.as_ref() == Some(&group.group);
+                    let icon = match group.group {
+                        Group::Genre(_) => IconName::Tag,
+                        Group::Energy(_) => IconName::Zap,
+                        Group::Decade(_) => IconName::Calendar,
+                        Group::Missing => IconName::FileSearch,
+                    };
+                    div()
+                        .id(("group", index))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .h(px(28.))
+                        .px_2()
+                        .rounded_md()
+                        .text_sm()
+                        .when(selected, |this| this.bg(hover))
+                        .hover(|style| style.bg(hover))
+                        .child(Icon::new(icon).small().text_color(muted))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(group.group.label()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(group.count.to_string()),
+                        )
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.select_group(chosen.clone(), cx)
+                            }),
+                        )
+                }))
+            })
             .when(!self.compact, |this| {
                 this.child(div().flex_1())
                     .child(self.wheel(cx))
@@ -1671,69 +2602,27 @@ impl LibraryView {
     }
 
     fn playlist_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let (hover, muted) = (theme.secondary, theme.muted_foreground);
+        let mut rows = Vec::new();
+        self.playlist_rows(None, 0, &mut rows, cx);
         div()
             .flex()
             .flex_col()
-            .w(px(220.))
+            .w(px(240.))
             .gap_1()
             .p_2()
             .border_1()
-            .border_color(theme.border)
+            .border_color(cx.theme().border)
             .rounded_lg()
-            .children(self.playlists.iter().map(|playlist| {
-                let id = playlist.id;
-                div()
-                    .id(("playlist", id as usize))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .h(px(32.))
-                    .px_2()
-                    .rounded_md()
-                    .text_sm()
-                    .when(self.playlist == Some(id), |this| this.bg(hover))
-                    .hover(|style| style.bg(hover))
-                    .child(Icon::new(IconName::ListMusic).small().text_color(muted))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .child(playlist.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_color(muted)
-                            .child(playlist.track_count.to_string()),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.playlist = Some(id);
-                        this.reload(cx);
-                    }))
-                    .child(
-                        Button::new(("delete-playlist", id as usize))
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Minus)
-                            .tooltip("Delete playlist (tracks stay in the library)")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.delete_playlist(id, cx);
-                            })),
-                    )
-            }))
-            .child(div().flex_1())
             .child(
-                Button::new("import-playlists")
-                    .outline()
-                    .icon(IconName::Download)
-                    .label("Import playlists")
-                    .tooltip("From a rekordbox XML export, a VirtualDJ folder or M3U files")
-                    .on_click(cx.listener(|this, _, _, cx| this.import_playlists(cx))),
+                div()
+                    .id("playlist-tree")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .children(rows),
             )
-            .child(self.export_button(cx))
             .child(
                 Button::new("new-playlist")
                     .outline()
@@ -1743,6 +2632,307 @@ impl LibraryView {
                         cx.listener(|this, _, window, cx| this.new_playlist_dialog(window, cx)),
                     ),
             )
+            .child(
+                Button::new("new-smart-playlist")
+                    .outline()
+                    .icon(IconName::WandSparkles)
+                    .label("New smart playlist")
+                    .tooltip("A playlist that fills itself from rules, such as genre and tempo")
+                    .on_click(cx.listener(|this, _, window, cx| this.edit_smart(None, window, cx))),
+            )
+            .child(
+                Button::new("new-folder")
+                    .outline()
+                    .icon(IconName::FolderPlus)
+                    .label("New folder")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.ask_name(
+                            "New folder",
+                            "",
+                            "Create",
+                            |this, name, cx| {
+                                this.change_library(
+                                    |library| library.create_folder(&name, None).map(|_| ()),
+                                    cx,
+                                )
+                            },
+                            window,
+                            cx,
+                        )
+                    })),
+            )
+            .child(
+                Button::new("import-playlists")
+                    .outline()
+                    .icon(IconName::Download)
+                    .label("Import playlists")
+                    .tooltip("From a rekordbox XML export, a VirtualDJ folder or M3U files")
+                    .on_click(cx.listener(|this, _, _, cx| this.import_playlists(cx))),
+            )
+            .child(self.export_button(cx))
+    }
+
+    /// The folders and playlists in `folder` (the top level for `None`),
+    /// indented by `depth`, with open folders' contents below them.
+    fn playlist_rows(
+        &self,
+        folder: Option<i64>,
+        depth: usize,
+        rows: &mut Vec<AnyElement>,
+        cx: &mut Context<Self>,
+    ) {
+        let theme = cx.theme();
+        let (hover, muted) = (theme.secondary, theme.muted_foreground);
+        let indent = px(8. + depth as f32 * 14.);
+        for sub in self.folders.iter().filter(|f| f.parent == folder) {
+            let id = sub.id;
+            let open = !self.collapsed.contains(&id);
+            rows.push(
+                div()
+                    .id(("folder", id as usize))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(30.))
+                    .pl(indent)
+                    .pr_1()
+                    .rounded_md()
+                    .text_sm()
+                    .hover(|style| style.bg(hover))
+                    .child(
+                        Icon::new(if open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .xsmall()
+                        .text_color(muted),
+                    )
+                    .child(Icon::new(IconName::Folder).small().text_color(muted))
+                    .child(div().flex_1().min_w_0().truncate().child(sub.name.clone()))
+                    .child(self.folder_menu(sub, cx))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.collapsed.remove(&id) {
+                            this.collapsed.insert(id);
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+            if open {
+                self.playlist_rows(Some(id), depth + 1, rows, cx);
+            }
+        }
+        for playlist in self.playlists.iter().filter(|p| p.folder == folder) {
+            let id = playlist.id;
+            let theme = cx.theme();
+            rows.push(
+                div()
+                    .id(("playlist", id as usize))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(30.))
+                    .pl(indent)
+                    .pr_1()
+                    .rounded_md()
+                    .text_sm()
+                    .when(self.playlist == Some(id), |this| this.bg(theme.secondary))
+                    .hover(|style| style.bg(hover))
+                    .child(
+                        Icon::new(if playlist.rules.is_some() {
+                            IconName::WandSparkles
+                        } else {
+                            IconName::ListMusic
+                        })
+                        .small()
+                        .text_color(muted),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(playlist.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(playlist.track_count.to_string()),
+                    )
+                    .child(self.playlist_menu(playlist, cx))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.playlist = Some(id);
+                        this.reload(cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+    }
+
+    /// Menu entries that move something into each folder (or the top level),
+    /// leaving out `except` and its subfolders.
+    fn folder_choices(&self, except: Option<i64>) -> Vec<(Option<i64>, String)> {
+        let inside = |mut at: Option<i64>| {
+            while let Some(id) = at {
+                if Some(id) == except {
+                    return true;
+                }
+                at = self
+                    .folders
+                    .iter()
+                    .find(|f| f.id == id)
+                    .and_then(|f| f.parent);
+            }
+            false
+        };
+        std::iter::once((None, "Top level".to_string()))
+            .chain(
+                self.folders
+                    .iter()
+                    .filter(|f| !inside(Some(f.id)))
+                    .map(|f| (Some(f.id), f.name.clone())),
+            )
+            .collect()
+    }
+
+    fn playlist_menu(&self, playlist: &Playlist, cx: &mut Context<Self>) -> impl IntoElement {
+        let (id, name, smart) = (playlist.id, playlist.name.clone(), playlist.rules.is_some());
+        let view = cx.weak_entity();
+        let folders = self.folder_choices(None);
+        let current = playlist.folder;
+        Button::new(("playlist-menu", id as usize))
+            .ghost()
+            .xsmall()
+            .icon(IconName::Ellipsis)
+            .dropdown_menu(move |mut menu, _, _| {
+                let act = |label: &str, run: MenuAction| {
+                    let view = view.clone();
+                    PopupMenuItem::new(label.to_string()).on_click(move |_, window, cx| {
+                        view.update(cx, |view, cx| run(view, window, cx)).ok();
+                    })
+                };
+                let name = name.clone();
+                menu = menu.item(act(
+                    "Rename…",
+                    Box::new(move |this, window, cx| {
+                        this.ask_name(
+                            "Rename playlist",
+                            &name,
+                            "Rename",
+                            move |this, name, cx| {
+                                this.change_library(
+                                    |library| library.rename_playlist(id, &name),
+                                    cx,
+                                )
+                            },
+                            window,
+                            cx,
+                        )
+                    }),
+                ));
+                if smart {
+                    menu = menu.item(act(
+                        "Edit rules…",
+                        Box::new(move |this, window, cx| this.edit_smart(Some(id), window, cx)),
+                    ));
+                }
+                menu = menu.separator().label("Move to");
+                for (folder, label) in folders.clone() {
+                    menu = menu.item(
+                        act(
+                            &label,
+                            Box::new(move |this, _, cx| {
+                                this.change_library(|library| library.move_playlist(id, folder), cx)
+                            }),
+                        )
+                        .checked(folder == current),
+                    );
+                }
+                menu.separator().item(act(
+                    "Delete playlist",
+                    Box::new(move |this, _, cx| this.delete_playlist(id, cx)),
+                ))
+            })
+    }
+
+    fn folder_menu(&self, folder: &PlaylistFolder, cx: &mut Context<Self>) -> impl IntoElement {
+        let (id, name, current) = (folder.id, folder.name.clone(), folder.parent);
+        let view = cx.weak_entity();
+        let folders = self.folder_choices(Some(id));
+        Button::new(("folder-menu", id as usize))
+            .ghost()
+            .xsmall()
+            .icon(IconName::Ellipsis)
+            .dropdown_menu(move |mut menu, _, _| {
+                let act = |label: &str, run: MenuAction| {
+                    let view = view.clone();
+                    PopupMenuItem::new(label.to_string()).on_click(move |_, window, cx| {
+                        view.update(cx, |view, cx| run(view, window, cx)).ok();
+                    })
+                };
+                let name = name.clone();
+                menu = menu
+                    .item(act(
+                        "New folder inside…",
+                        Box::new(move |this, window, cx| {
+                            this.ask_name(
+                                "New folder",
+                                "",
+                                "Create",
+                                move |this, name, cx| {
+                                    this.collapsed.remove(&id);
+                                    this.change_library(
+                                        |library| {
+                                            library.create_folder(&name, Some(id)).map(|_| ())
+                                        },
+                                        cx,
+                                    )
+                                },
+                                window,
+                                cx,
+                            )
+                        }),
+                    ))
+                    .item(act(
+                        "Rename…",
+                        Box::new(move |this, window, cx| {
+                            this.ask_name(
+                                "Rename folder",
+                                &name,
+                                "Rename",
+                                move |this, name, cx| {
+                                    this.change_library(
+                                        |library| library.rename_folder(id, &name),
+                                        cx,
+                                    )
+                                },
+                                window,
+                                cx,
+                            )
+                        }),
+                    ))
+                    .separator()
+                    .label("Move to");
+                for (parent, label) in folders.clone() {
+                    menu = menu.item(
+                        act(
+                            &label,
+                            Box::new(move |this, _, cx| {
+                                this.change_library(|library| library.move_folder(id, parent), cx)
+                            }),
+                        )
+                        .checked(parent == current),
+                    );
+                }
+                menu.separator().item(act(
+                    "Delete folder (keeps its playlists)",
+                    Box::new(move |this, _, cx| {
+                        this.change_library(|library| library.delete_folder(id), cx)
+                    }),
+                ))
+            })
     }
 
     /// Asks for a name and creates a playlist with it.
@@ -2080,6 +3270,51 @@ impl LibraryView {
                             .text_color(cx.theme().muted_foreground)
                             .child(status),
                     )
+                    .when(self.group == Some(Group::Missing) && !self.compact, |this| {
+                        this.child(
+                            Button::new("find-moved")
+                                .outline()
+                                .small()
+                                .icon(IconName::FileSearch)
+                                .label("Find in a folder…")
+                                .tooltip("Look for the missing files in a folder and relink them")
+                                .on_click(cx.listener(|this, _, window, cx| this.find_moved(window, cx))),
+                        )
+                        .child(
+                            Button::new("remove-missing-tracks")
+                                .outline()
+                                .small()
+                                .icon(IconName::Trash)
+                                .label("Remove all")
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.remove_missing(window, cx)),
+                                ),
+                        )
+                    })
+                    .when_some(
+                        self.reference.clone().filter(|_| self.compact),
+                        |this, (_, title)| {
+                            this.child(
+                                Button::new("suggest-next")
+                                    .outline()
+                                    .small()
+                                    .icon(IconName::Sparkles)
+                                    .label(if self.suggesting {
+                                        format!("Mixes with {title}")
+                                    } else {
+                                        "Suggest next".to_string()
+                                    })
+                                    .tooltip("Tracks whose key and tempo mix with the track on the decks")
+                                    .selected(self.suggesting)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.suggesting = !this.suggesting;
+                                        this.reload(cx);
+                                    })),
+                            )
+                        },
+                    )
+                    .child(self.columns_button(cx))
+                    .when(!self.compact, |this| this.child(self.tag_tools_button(cx)))
                     .when(self.wheel_in_browser, |this| {
                         this.child(self.wheel_button(cx))
                     }),

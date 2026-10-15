@@ -1,6 +1,7 @@
-//! On-disk cache of track waveforms, so a track that has been loaded before
-//! shows its whole waveform at once. Strictly best effort: a missing, stale
-//! or damaged entry is ignored and rebuilt.
+//! On-disk cache of track waveforms, so a track that has been loaded or
+//! analysed before shows its whole waveform at once. An entry made at one
+//! sample rate serves any other. Strictly best effort: a missing or damaged
+//! entry is ignored and rebuilt.
 
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
@@ -13,7 +14,8 @@ const HEADER_LEN: usize = 24;
 const KEY_SAMPLE: u64 = 64 * 1024;
 
 pub(crate) struct CachedWaveform {
-    /// Exact track length at the cached sample rate.
+    /// Track length at the sample rate asked for: exact if the entry was
+    /// made at that rate, otherwise to within a frame.
     pub(crate) frames: usize,
     pub(crate) peaks: Vec<f32>,
 }
@@ -50,14 +52,36 @@ impl Entry {
         let (header, peaks) = bytes.split_at_checked(HEADER_LEN)?;
         let u32_at = |at: usize| u32::from_le_bytes(header[at..at + 4].try_into().unwrap());
         let frames = u64::from_le_bytes(header[16..24].try_into().unwrap()) as usize;
+        let (stored_rate, stored_per_peak) = (u32_at(8), u32_at(12) as usize);
         let valid = &header[..4] == MAGIC
             && u32_at(4) == VERSION
-            && u32_at(8) == sample_rate
-            && u32_at(12) as usize == frames_per_peak
-            && peaks.len() == frames.div_ceil(frames_per_peak);
-        valid.then(|| CachedWaveform {
-            frames,
-            peaks: peaks.iter().map(|peak| *peak as f32 / 255.0).collect(),
+            && stored_rate > 0
+            && stored_per_peak > 0
+            && peaks.len() == frames.div_ceil(stored_per_peak);
+        if !valid {
+            return None;
+        }
+        let peaks: Vec<f32> = peaks.iter().map(|peak| *peak as f32 / 255.0).collect();
+        if (stored_rate, stored_per_peak) == (sample_rate, frames_per_peak) {
+            return Some(CachedWaveform { frames, peaks });
+        }
+
+        // Each peak wanted spans some stretch of time; take the largest of
+        // the stored peaks over that stretch.
+        let scaled = (frames as u64 * sample_rate as u64).div_ceil(stored_rate as u64) as usize;
+        let stored_index = |frame: usize| {
+            (frame as u64 * stored_rate as u64 / sample_rate as u64) as usize / stored_per_peak
+        };
+        let resampled = (0..scaled.div_ceil(frames_per_peak))
+            .map(|peak| {
+                let from = stored_index(peak * frames_per_peak);
+                let to = (stored_index((peak + 1) * frames_per_peak - 1) + 1).min(peaks.len());
+                peaks[from.min(to)..to].iter().copied().fold(0.0, f32::max)
+            })
+            .collect();
+        Some(CachedWaveform {
+            frames: scaled,
+            peaks: resampled,
         })
     }
 

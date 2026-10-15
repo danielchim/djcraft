@@ -1,8 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use djcraft_library::{
-    Camelot, ClipPlacement, CuePoint, ImportSummary, Library, ScanSummary, SourceKind, TempoResult,
-    TrackEdit, TrackQuery, read_artwork, read_playlists,
+    AlignOptions, Camelot, Cleanup, ClipPlacement, CuePoint, EnergyBand, FolderWatcher, Group,
+    ImportSummary, KeepTagged, KeyFit, KeyResult, Library, Placement, Rule, ScanSummary,
+    SmartRules, SourceKind, TagField, TempoResult, TextField, TextOp, TrackEdit, TrackQuery,
+    read_artwork, read_playlists,
 };
 use lofty::config::WriteOptions;
 use lofty::tag::{Accessor, ItemKey, Tag, TagExt, TagType};
@@ -162,15 +164,16 @@ fn rescan_picks_up_changes_only() {
             added: 1,
             updated: 1,
             unchanged: 0,
-            removed: 1
+            removed: 1,
+            relinked: 0,
         }
     );
-    assert_eq!(titles(&library, ""), ["c", "Two (Remix)"]);
+    // The track whose file went stays, marked missing.
+    assert_eq!(titles(&library, ""), ["c", "One", "Two (Remix)"]);
+    let tracks = library.tracks(&TrackQuery::default()).unwrap();
+    assert!(tracks[1].missing && !tracks[2].missing);
     // A re-read file keeps its identity, so playlists can keep pointing at it.
-    assert_eq!(
-        library.tracks(&TrackQuery::default()).unwrap()[1].id,
-        id_of_two
-    );
+    assert_eq!(tracks[2].id, id_of_two);
 }
 
 #[test]
@@ -184,6 +187,58 @@ fn a_missing_folder_does_not_empty_the_library() {
     std::fs::remove_dir_all(&dir.0).unwrap();
     assert!(library.scan(source.id, |_| {}).is_err());
     assert_eq!(titles(&library, ""), ["a"]);
+}
+
+/// Waits for the watcher to report a change, for as long as a slow
+/// machine might take to deliver one.
+fn changed_soon(watcher: &FolderWatcher) -> Vec<i64> {
+    for _ in 0..200 {
+        let changed = watcher.take_changed(std::time::Duration::ZERO);
+        if !changed.is_empty() {
+            return changed;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Vec::new()
+}
+
+#[test]
+fn a_watched_folder_reports_added_and_removed_files() {
+    let dir = TempDir::new("watch");
+    std::fs::create_dir_all(dir.0.join("house")).unwrap();
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+
+    let mut watcher = FolderWatcher::new();
+    watcher.watch(source.id, &dir.0).unwrap();
+
+    write_wav(&dir.0.join("house").join("new.wav"));
+    assert_eq!(changed_soon(&watcher), [source.id]);
+    // Changes are held back while they are still coming in.
+    write_wav(&dir.0.join("house").join("newer.wav"));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(
+        watcher
+            .take_changed(std::time::Duration::from_secs(3600))
+            .is_empty()
+    );
+    assert_eq!(changed_soon(&watcher), [source.id]);
+    let summary = library.scan(source.id, |_| {}).unwrap();
+    assert_eq!(summary.added, 2);
+
+    // Late reports of the writes above must not pass for the removal.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    watcher.take_changed(std::time::Duration::ZERO);
+    std::fs::remove_file(dir.0.join("house").join("new.wav")).unwrap();
+    assert_eq!(changed_soon(&watcher), [source.id]);
+    assert_eq!(library.scan(source.id, |_| {}).unwrap().removed, 1);
+
+    watcher.unwatch(source.id);
+    write_wav(&dir.0.join("ignored.wav"));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(watcher.take_changed(std::time::Duration::ZERO).is_empty());
+    assert!(watcher.watch(source.id, &dir.0.join("missing")).is_err());
 }
 
 #[test]
@@ -344,7 +399,20 @@ fn an_existing_library_gains_playlists_on_upgrade() {
     // Put the file back to how the first schema left it.
     let raw = rusqlite::Connection::open(&db).unwrap();
     raw.execute_batch(
-        "DROP TABLE playlist_tracks; DROP TABLE playlists;
+        "DROP TABLE ignored_files;
+         ALTER TABLE playlists DROP COLUMN folder_id;
+         DROP TABLE playlist_folders;
+         ALTER TABLE playlists DROP COLUMN rules;
+         ALTER TABLE tracks DROP COLUMN year;
+         ALTER TABLE tracks DROP COLUMN year_checked;
+         ALTER TABLE tracks DROP COLUMN missing;
+         DROP TABLE tag_history; DROP TABLE tag_batches;
+         DROP TABLE playlist_tracks; DROP TABLE playlists;
+         DROP TABLE options;
+         ALTER TABLE tracks DROP COLUMN tempo_downbeat;
+         ALTER TABLE tracks DROP COLUMN key_manual;
+         ALTER TABLE tracks DROP COLUMN key_detected;
+         ALTER TABLE tracks DROP COLUMN key_confidence;
          ALTER TABLE tracks DROP COLUMN cues_manual;
          DROP TABLE cues; ALTER TABLE tracks DROP COLUMN energy;
          ALTER TABLE flow_clips DROP COLUMN key_shift;
@@ -363,6 +431,7 @@ fn an_existing_library_gains_playlists_on_upgrade() {
     let library = Library::open(&db).unwrap();
     assert_eq!(library.create_playlist("New").unwrap().name, "New");
     assert!(library.pending_tempo_analysis(1).unwrap().is_empty());
+    assert!(library.key_counts().unwrap().is_empty());
 }
 
 fn file_url(path: &Path) -> String {
@@ -583,6 +652,8 @@ fn editing_a_track_writes_its_tags() {
         album: "The Album".into(),
         genre: String::new(),
         bpm: Some(127.5),
+        comment: None,
+        grouping: None,
         key: Some("8A".into()),
     };
     let tagged = find(&library, "Old");
@@ -661,6 +732,7 @@ fn measured_tempo_is_stored_and_shown() {
     let sure = TempoResult {
         bpm: 128.02,
         first_beat_seconds: 0.25,
+        downbeat: 0,
         confidence: 0.4,
     };
     library.store_tempo(tagged, 1, Some(sure)).unwrap();
@@ -671,6 +743,7 @@ fn measured_tempo_is_stored_and_shown() {
     let unsure = TempoResult {
         bpm: 87.0,
         first_beat_seconds: 0.0,
+        downbeat: 0,
         confidence: 0.03,
     };
     library.store_tempo(bare, 1, Some(unsure)).unwrap();
@@ -688,6 +761,8 @@ fn measured_tempo_is_stored_and_shown() {
         album: String::new(),
         genre: String::new(),
         bpm: Some(128.02),
+        comment: None,
+        grouping: None,
         key: None,
     };
     library.edit_track(tagged, &edit).unwrap();
@@ -753,6 +828,692 @@ fn tracks_can_be_counted_and_filtered_by_key() {
 }
 
 #[test]
+fn a_detected_key_stands_in_for_a_missing_tag() {
+    let dir = TempDir::new("detected-key");
+    write_tagged(&dir.0.join("a.wav"), "Tagged", "A", "", "120", "Am");
+    write_wav(&dir.0.join("b.wav"));
+    write_wav(&dir.0.join("c.wav"));
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let all = library.tracks(&TrackQuery::default()).unwrap();
+    let id_of = |title: &str| all.iter().find(|t| t.title == title).unwrap().id;
+    let key_of = |library: &Library, id: i64| {
+        let query = TrackQuery {
+            id: Some(id),
+            ..Default::default()
+        };
+        let track = library.tracks(&query).unwrap().remove(0);
+        (track.key, track.camelot.map(|key| key.to_string()))
+    };
+    let found = |key: &str, confidence: f64| {
+        Some(KeyResult {
+            key: Camelot::parse(key).unwrap(),
+            confidence,
+        })
+    };
+
+    // What the file's tags say is kept, whatever analysis makes of it.
+    library
+        .store_key(id_of("Tagged"), found("3B", 0.9))
+        .unwrap();
+    assert_eq!(
+        key_of(&library, id_of("Tagged")),
+        (Some("Am".into()), Some("8A".into()))
+    );
+
+    // A track with no key in its tags takes the detected one, if it is sure.
+    assert_eq!(key_of(&library, id_of("b")), (None, None));
+    library.store_key(id_of("b"), found("9A", 0.8)).unwrap();
+    assert_eq!(
+        key_of(&library, id_of("b")),
+        (Some("9A".into()), Some("9A".into()))
+    );
+    library.store_key(id_of("c"), found("5B", 0.2)).unwrap();
+    assert_eq!(key_of(&library, id_of("c")), (None, None));
+
+    // Detected keys count on the wheel and can be filtered by.
+    let counts = library.key_counts().unwrap();
+    assert_eq!(counts.get(&Camelot::parse("9A").unwrap()), Some(&1));
+    assert_eq!(counts.len(), 2);
+    let query = TrackQuery {
+        keys: Camelot::parse("8A").unwrap().compatible().to_vec(),
+        ..Default::default()
+    };
+    assert_eq!(library.tracks(&query).unwrap().len(), 2);
+
+    library.store_key(id_of("b"), None).unwrap();
+    assert_eq!(key_of(&library, id_of("b")), (None, None));
+}
+
+#[test]
+fn tagged_tempo_and_key_can_be_kept_over_measured_ones() {
+    let dir = TempDir::new("keep-tagged");
+    write_tagged(&dir.0.join("a.wav"), "Tagged", "A", "", "126", "Am");
+    write_wav(&dir.0.join("b.wav"));
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let all = library.tracks(&TrackQuery::default()).unwrap();
+    let id_of = |title: &str| all.iter().find(|t| t.title == title).unwrap().id;
+    let (tagged, bare) = (id_of("Tagged"), id_of("b"));
+    let listed = |library: &Library, id: i64| {
+        let query = TrackQuery {
+            id: Some(id),
+            ..Default::default()
+        };
+        let track = library.tracks(&query).unwrap().remove(0);
+        (track.bpm, track.key)
+    };
+    let grid = TempoResult {
+        bpm: 125.98,
+        first_beat_seconds: 0.2,
+        downbeat: 3,
+        confidence: 0.6,
+    };
+    let key = |code: &str| {
+        Some(KeyResult {
+            key: Camelot::parse(code).unwrap(),
+            confidence: 0.9,
+        })
+    };
+    for id in [tagged, bare] {
+        library.store_tempo(id, 1, Some(grid)).unwrap();
+        library.store_key(id, key("3B")).unwrap();
+    }
+
+    // At first, measured tempos and tagged keys are listed.
+    assert_eq!(library.keep_tagged().unwrap(), KeepTagged::default());
+    assert_eq!(listed(&library, tagged), (Some(125.98), Some("Am".into())));
+    assert_eq!(library.beat_grid(tagged).unwrap(), Some(grid));
+
+    // The other way round, for every connection to the library.
+    let both_ways = KeepTagged {
+        tempo: true,
+        key: false,
+    };
+    library.set_keep_tagged(both_ways).unwrap();
+    assert_eq!(library.keep_tagged().unwrap(), both_ways);
+    assert_eq!(listed(&library, tagged), (Some(126.0), Some("3B".into())));
+    // A track with nothing in its tags still shows what was measured, and
+    // the grid is the measured one whatever is listed.
+    assert_eq!(listed(&library, bare), (Some(125.98), Some("3B".into())));
+    assert_eq!(library.beat_grid(tagged).unwrap(), Some(grid));
+    assert_eq!(library.key_counts().unwrap().len(), 1);
+    assert!((grid.first_bar_seconds() - (0.2 + 3.0 * 60.0 / 125.98)).abs() < 1e-9);
+    let path = all.iter().find(|t| t.id == bare).unwrap().path.clone();
+    assert_eq!(library.track_at(&path).unwrap(), Some(bare));
+    // The same file by a path that is not the real one: on macOS the temp
+    // folder is reached through a link.
+    assert_eq!(library.track_at(&dir.0.join("b.wav")).unwrap(), Some(bare));
+    assert_eq!(
+        library.track_at(&dir.0.join(".").join("b.wav")).unwrap(),
+        Some(bare)
+    );
+    assert_eq!(library.track_at(&dir.0.join("missing.wav")).unwrap(), None);
+
+    // A key typed in stands, even over a detected one.
+    let edit = TrackEdit {
+        title: "Tagged".into(),
+        artist: "A".into(),
+        album: String::new(),
+        genre: String::new(),
+        bpm: Some(126.0),
+        comment: None,
+        grouping: None,
+        key: Some("5A".into()),
+    };
+    library.edit_track(tagged, &edit).unwrap();
+    assert_eq!(listed(&library, tagged), (Some(126.0), Some("5A".into())));
+
+    // Everything can be queued for analysis again.
+    assert!(library.pending_tempo_analysis(1).unwrap().is_empty());
+    assert_eq!(library.reset_analysis().unwrap(), 2);
+    assert_eq!(library.pending_tempo_analysis(1).unwrap().len(), 2);
+}
+
+#[test]
+fn batch_tag_changes_are_reviewed_applied_and_undone() {
+    let dir = TempDir::new("batch-tags");
+    write_tagged(&dir.0.join("a.wav"), "losing  it", "fisher", "", "", "");
+    write_tagged(
+        &dir.0.join("b.wav"),
+        "One More Time (Original Mix)",
+        "Daft Punk",
+        "",
+        "",
+        "",
+    );
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let ids: Vec<i64> = library
+        .tracks(&TrackQuery::default())
+        .unwrap()
+        .iter()
+        .map(|t| t.id)
+        .collect();
+    let titles = |library: &Library| titles(library, "");
+
+    // Clean-up: spaces, then capitals, each a batch of its own.
+    let spaces = library.plan_cleanup(&ids, &Cleanup::ExtraSpaces).unwrap();
+    assert_eq!(spaces.len(), 1);
+    assert_eq!(
+        spaces[0].differences(),
+        [("Title", "losing  it".to_string(), "losing it".to_string())]
+    );
+    let applied = library
+        .apply_changes("Remove extra spaces", &spaces)
+        .unwrap();
+    assert_eq!((applied.written, applied.skipped.len()), (1, 0));
+    let capitals = library.plan_cleanup(&ids, &Cleanup::Capitalise).unwrap();
+    library
+        .apply_changes("Fix capitalisation", &capitals)
+        .unwrap();
+    assert_eq!(
+        titles(&library),
+        ["One More Time (Original Mix)", "Losing It"]
+    );
+
+    // Find and replace, in the chosen fields only.
+    let replace = Cleanup::Replace {
+        find: "original mix".into(),
+        replace: "Extended Mix".into(),
+        fields: vec![TagField::Title],
+        match_case: false,
+    };
+    let planned = library.plan_cleanup(&ids, &replace).unwrap();
+    library.apply_changes("Replace", &planned).unwrap();
+    assert!(titles(&library).contains(&"One More Time (Extended Mix)".to_string()));
+
+    // The last batch can be undone, then the one before it.
+    let last = library.last_batch().unwrap().unwrap();
+    assert_eq!((last.label.as_str(), last.files), ("Replace", 1));
+    library.undo_batch(last.id).unwrap();
+    assert!(titles(&library).contains(&"One More Time (Original Mix)".to_string()));
+    let before = library.last_batch().unwrap().unwrap();
+    assert_eq!(before.label, "Fix capitalisation");
+    library.undo_batch(before.id).unwrap();
+    assert_eq!(
+        titles(&library),
+        ["One More Time (Original Mix)", "losing it"]
+    );
+
+    // A file changed after review is left alone.
+    let stale = library.plan_cleanup(&ids, &Cleanup::Capitalise).unwrap();
+    write_tagged(
+        &dir.0.join("a.wav"),
+        "edited elsewhere",
+        "fisher",
+        "",
+        "",
+        "",
+    );
+    let applied = library.apply_changes("Stale", &stale).unwrap();
+    assert_eq!(applied.written, 0);
+    assert_eq!(applied.skipped.len(), 1);
+    library.scan(source.id, |_| {}).unwrap();
+
+    // Analysis written into the tags, where the options say.
+    let fisher = library
+        .tracks(&TrackQuery::default())
+        .unwrap()
+        .into_iter()
+        .find(|t| t.artist == "fisher")
+        .unwrap();
+    library
+        .store_tempo(
+            fisher.id,
+            1,
+            Some(TempoResult {
+                bpm: 125.004,
+                first_beat_seconds: 0.0,
+                downbeat: 0,
+                confidence: 0.9,
+            }),
+        )
+        .unwrap();
+    library
+        .store_key(
+            fisher.id,
+            Some(KeyResult {
+                key: Camelot::parse("8A").unwrap(),
+                confidence: 0.9,
+            }),
+        )
+        .unwrap();
+    library.store_structure(fisher.id, Some(7), &[]).unwrap();
+    let options = AlignOptions {
+        bpm: true,
+        key: Placement::KeyField,
+        energy: Placement::Comment,
+    };
+    let planned = library.plan_align(&[fisher.id], &options).unwrap();
+    let applied = library.apply_changes("Write analysis", &planned).unwrap();
+    assert_eq!(applied.written, 1);
+    let (_, tags) = library.file_tags(fisher.id).unwrap();
+    assert_eq!(tags.bpm, Some(125.0));
+    assert_eq!(tags.key.as_deref(), Some("8A"));
+    assert_eq!(tags.comment.as_deref(), Some("Energy 7"));
+    // Writing what was measured does not mark it as typed in.
+    assert!(
+        library
+            .plan_align(&[fisher.id], &options)
+            .unwrap()
+            .is_empty()
+    );
+
+    // Files renamed from their details, in their folder, and back.
+    let planned = library.plan_rename(&ids, "{artist} - {title}").unwrap();
+    assert_eq!(planned.len(), 2);
+    library.apply_changes("Rename", &planned).unwrap();
+    let mut names: Vec<String> = std::fs::read_dir(&dir.0)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "Daft Punk - One More Time (Original Mix).wav",
+            "fisher - edited elsewhere.wav"
+        ]
+    );
+    // The library follows the new names, so a scan finds nothing to do.
+    let scan = library.scan(source.id, |_| {}).unwrap();
+    assert_eq!((scan.added, scan.removed), (0, 0));
+    let rename = library.last_batch().unwrap().unwrap();
+    library.undo_batch(rename.id).unwrap();
+    assert!(dir.0.join("a.wav").exists() && dir.0.join("b.wav").exists());
+    let scan = library.scan(source.id, |_| {}).unwrap();
+    assert_eq!((scan.added, scan.removed), (0, 0));
+}
+
+#[test]
+fn tags_are_written_and_read_back_in_every_format() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let dir = TempDir::new("formats");
+    let formats = ["mp3", "flac", "ogg", "opus", "m4a", "aiff"];
+    for format in formats {
+        std::fs::copy(
+            fixtures.join(format!("silence.{format}")),
+            dir.0.join(format!("{format}.{format}")),
+        )
+        .unwrap();
+    }
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let tracks = library.tracks(&TrackQuery::default()).unwrap();
+    assert_eq!(tracks.len(), formats.len());
+
+    for track in &tracks {
+        let edit = TrackEdit {
+            title: format!("Title {}", track.title),
+            artist: "Artist Ü".into(),
+            album: "Album".into(),
+            genre: "Tech House".into(),
+            bpm: Some(127.5),
+            key: Some("8A".into()),
+            comment: Some("8A - Energy 7".into()),
+            grouping: Some("Peak time".into()),
+        };
+        library
+            .edit_track(track.id, &edit)
+            .unwrap_or_else(|e| panic!("{}: {e}", track.title));
+        let (_, read) = library.file_tags(track.id).unwrap();
+        assert_eq!(read, edit, "{}", track.title);
+    }
+
+    // A library built afresh from the files agrees.
+    let mut fresh = Library::open_in_memory().unwrap();
+    let source = fresh.add_folder(&dir.0).unwrap();
+    fresh.scan(source.id, |_| {}).unwrap();
+    for track in fresh.tracks(&TrackQuery::default()).unwrap() {
+        assert!(track.title.starts_with("Title "), "{}", track.title);
+        assert_eq!(track.artist, "Artist Ü");
+        assert_eq!(track.camelot, Camelot::parse("8A"), "{}", track.title);
+    }
+}
+
+#[test]
+fn missing_files_are_kept_followed_and_found_again() {
+    let dir = TempDir::new("missing");
+    std::fs::create_dir_all(dir.0.join("old")).unwrap();
+    std::fs::create_dir_all(dir.0.join("new")).unwrap();
+    write_tagged(&dir.0.join("old").join("a.wav"), "Alpha", "A", "", "", "");
+    write_wav_of(&dir.0.join("b.wav"), 2);
+    let elsewhere = TempDir::new("missing-elsewhere");
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let id_of = |library: &Library, title: &str| {
+        library
+            .tracks(&TrackQuery::default())
+            .unwrap()
+            .into_iter()
+            .find(|t| t.title == title)
+            .unwrap()
+    };
+    let alpha = id_of(&library, "Alpha");
+    library
+        .store_tempo(
+            alpha.id,
+            7,
+            Some(TempoResult {
+                bpm: 124.0,
+                first_beat_seconds: 0.0,
+                downbeat: 0,
+                confidence: 0.9,
+            }),
+        )
+        .unwrap();
+    let playlist = library.create_playlist("Set").unwrap();
+    library.add_to_playlist(playlist.id, &[alpha.id]).unwrap();
+
+    // A file moved within the folder is followed: same track, same analysis.
+    std::fs::rename(
+        dir.0.join("old").join("a.wav"),
+        dir.0.join("new").join("a.wav"),
+    )
+    .unwrap();
+    let summary = library.scan(source.id, |_| {}).unwrap();
+    assert_eq!(
+        (summary.relinked, summary.added, summary.removed),
+        (1, 0, 0)
+    );
+    let moved = id_of(&library, "Alpha");
+    assert_eq!(moved.id, alpha.id);
+    assert!(moved.path.ends_with("new/a.wav"));
+    let pending = library.pending_tempo_analysis(7).unwrap();
+    assert!(pending.iter().all(|(id, _)| *id != alpha.id));
+
+    // A file moved out of the library is missing, but keeps its playlist.
+    std::fs::rename(dir.0.join("new").join("a.wav"), elsewhere.0.join("a.wav")).unwrap();
+    std::fs::rename(dir.0.join("b.wav"), elsewhere.0.join("b.wav")).unwrap();
+    let summary = library.scan(source.id, |_| {}).unwrap();
+    assert_eq!(summary.removed, 2);
+    let missing = TrackQuery {
+        group: Some(Group::Missing),
+        ..Default::default()
+    };
+    assert_eq!(library.tracks(&missing).unwrap().len(), 2);
+    let in_set = TrackQuery {
+        playlist: Some(playlist.id),
+        ..Default::default()
+    };
+    assert_eq!(library.tracks(&in_set).unwrap().len(), 1);
+
+    // Searching a folder finds them by name and size; relocating relinks.
+    let found = library.find_moved(&elsewhere.0).unwrap();
+    assert_eq!(found.len(), 2);
+    for (track, path) in &found {
+        library.relocate(track.id, path).unwrap();
+    }
+    assert!(library.tracks(&missing).unwrap().is_empty());
+    let relocated = id_of(&library, "Alpha");
+    assert_eq!(relocated.id, alpha.id);
+    assert_eq!(relocated.source_name, "Imported files");
+    assert_eq!(library.tracks(&in_set).unwrap()[0].id, alpha.id);
+
+    // Missing tracks can be removed for good.
+    std::fs::remove_file(elsewhere.0.join("b.wav")).unwrap();
+    let loose = library
+        .sources()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind == SourceKind::Files)
+        .unwrap();
+    library.scan(loose.id, |_| {}).unwrap();
+    assert_eq!(library.remove_missing().unwrap(), 1);
+    assert_eq!(titles(&library, ""), ["Alpha"]);
+}
+
+#[test]
+fn playlists_have_folders_and_order() {
+    let dir = TempDir::new("folders");
+    write_tagged(&dir.0.join("a.wav"), "One", "A", "Tech House", "124", "8A");
+    write_tagged(&dir.0.join("b.wav"), "Two", "B", "tech house", "126", "9A");
+    write_tagged(&dir.0.join("c.wav"), "Three", "C", "Disco", "110", "3B");
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let all = library.tracks(&TrackQuery::default()).unwrap();
+    let id = |title: &str| all.iter().find(|t| t.title == title).unwrap().id;
+    // Folders hold playlists and other folders; deleting one keeps them.
+    let gigs = library.create_folder("Gigs", None).unwrap();
+    let summer = library.create_folder("Summer", Some(gigs.id)).unwrap();
+    let set = library.create_playlist("Opening").unwrap();
+    library.move_playlist(set.id, Some(summer.id)).unwrap();
+    assert!(library.move_folder(gigs.id, Some(summer.id)).is_err());
+    library.rename_folder(summer.id, "Summer 2026").unwrap();
+    library.delete_folder(summer.id).unwrap();
+    let folders = library.folders().unwrap();
+    assert_eq!(folders.len(), 1);
+    let opening = library.playlists().unwrap().pop().unwrap();
+    assert_eq!(opening.folder, Some(gigs.id));
+
+    // Tracks can be put in another order.
+    library
+        .add_to_playlist(set.id, &[id("One"), id("Two"), id("Three")])
+        .unwrap();
+    library.move_in_playlist(set.id, id("Three"), 0).unwrap();
+    let in_set = TrackQuery {
+        playlist: Some(set.id),
+        ..Default::default()
+    };
+    let order: Vec<String> = library
+        .tracks(&in_set)
+        .unwrap()
+        .into_iter()
+        .map(|t| t.title)
+        .collect();
+    assert_eq!(order, ["Three", "One", "Two"]);
+}
+
+#[test]
+fn smart_playlists_choose_their_own_tracks() {
+    let dir = TempDir::new("smart");
+    write_tagged(&dir.0.join("a.wav"), "One", "A", "Tech House", "124", "8A");
+    write_tagged(&dir.0.join("b.wav"), "Two", "B", "tech house", "126", "9A");
+    write_tagged(&dir.0.join("c.wav"), "Three", "C", "Disco", "110", "3B");
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let all = library.tracks(&TrackQuery::default()).unwrap();
+    let id = |title: &str| all.iter().find(|t| t.title == title).unwrap().id;
+    // A smart playlist holds what its rules choose, and takes no tracks by hand.
+    let rules = SmartRules {
+        match_all: true,
+        rules: vec![
+            Rule::Text {
+                field: TextField::Genre,
+                op: TextOp::Is,
+                value: "Tech House".into(),
+            },
+            Rule::Key {
+                key: Camelot::parse("8A").unwrap(),
+                compatible: true,
+            },
+        ],
+    };
+    let smart = library.create_smart_playlist("Warm-up", &rules).unwrap();
+    let chosen = TrackQuery {
+        playlist: Some(smart.id),
+        ..Default::default()
+    };
+    let titles_in = |library: &Library| -> Vec<String> {
+        library
+            .tracks(&chosen)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.title)
+            .collect()
+    };
+    assert_eq!(titles_in(&library), ["One", "Two"]);
+    let listed = library
+        .playlists()
+        .unwrap()
+        .into_iter()
+        .find(|p| p.id == smart.id)
+        .unwrap();
+    assert_eq!((listed.track_count, listed.rules), (2, Some(rules.clone())));
+    assert!(library.add_to_playlist(smart.id, &[id("Three")]).is_err());
+    let any = SmartRules {
+        match_all: false,
+        rules: vec![
+            Rule::Bpm {
+                min: 100.0,
+                max: 115.0,
+            },
+            Rule::Text {
+                field: TextField::Title,
+                op: TextOp::StartsWith,
+                value: "on".into(),
+            },
+        ],
+    };
+    library.set_playlist_rules(smart.id, &any).unwrap();
+    assert_eq!(titles_in(&library), ["One", "Three"]);
+}
+
+#[test]
+fn tracks_fall_into_automatic_groups() {
+    let dir = TempDir::new("groups");
+    write_tagged(&dir.0.join("a.wav"), "One", "A", "Tech House", "124", "8A");
+    write_tagged(&dir.0.join("b.wav"), "Two", "B", "tech house", "126", "9A");
+    write_tagged(&dir.0.join("c.wav"), "Three", "C", "Disco", "110", "3B");
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let all = library.tracks(&TrackQuery::default()).unwrap();
+    let id = |title: &str| all.iter().find(|t| t.title == title).unwrap().id;
+    // Automatic groups, by genre (however it is capitalised) and energy.
+    library.store_structure(id("One"), Some(8), &[]).unwrap();
+    let groups = library.groups().unwrap();
+    let count = |group: Group| groups.iter().find(|g| g.group == group).map(|g| g.count);
+    assert_eq!(count(Group::Genre("Tech House".into())), Some(2));
+    assert_eq!(count(Group::Genre("Disco".into())), Some(1));
+    assert_eq!(count(Group::Energy(EnergyBand::High)), Some(1));
+    let tech = TrackQuery {
+        group: Some(Group::Genre("TECH HOUSE".into())),
+        ..Default::default()
+    };
+    assert_eq!(library.tracks(&tech).unwrap().len(), 2);
+}
+
+#[test]
+fn suggestions_mix_by_key_and_tempo() {
+    let dir = TempDir::new("suggest");
+    write_tagged(&dir.0.join("a.wav"), "One", "A", "Tech House", "124", "8A");
+    write_tagged(&dir.0.join("b.wav"), "Two", "B", "tech house", "126", "9A");
+    write_tagged(&dir.0.join("c.wav"), "Three", "C", "Disco", "110", "3B");
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let all = library.tracks(&TrackQuery::default()).unwrap();
+    let id = |title: &str| all.iter().find(|t| t.title == title).unwrap().id;
+    // What mixes after One: Two (next key, close tempo), not Three.
+    let next = library.suggest_next(id("One"), 10).unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].track.title, "Two");
+    assert_eq!(next[0].key_fit, KeyFit::Adjacent);
+    assert!((next[0].tempo_change - (124.0 / 126.0 - 1.0) * 100.0).abs() < 1e-9);
+}
+
+#[test]
+fn duplicates_merge_into_the_copy_kept() {
+    let dir = TempDir::new("duplicates");
+    write_tagged(&dir.0.join("a.wav"), "Losing It", "Fisher", "", "", "");
+    write_tagged(&dir.0.join("b.wav"), "Losing It", "FISHER", "", "", "");
+    write_tagged(
+        &dir.0.join("c.wav"),
+        "Losing It (Remix)",
+        "Fisher",
+        "",
+        "",
+        "",
+    );
+    write_wav_of(&dir.0.join("d.wav"), 3);
+    let mut library = Library::open_in_memory().unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let all = library.tracks(&TrackQuery::default()).unwrap();
+    let id_of = |name: &str| all.iter().find(|t| t.path.ends_with(name)).unwrap().id;
+    let set = library.create_playlist("Set").unwrap();
+    library.add_to_playlist(set.id, &[id_of("b.wav")]).unwrap();
+
+    // a and b match by name and length; c is another mix, and d other audio.
+    let groups = library.duplicate_groups().unwrap();
+    assert_eq!(groups.len(), 1);
+    let group: Vec<i64> = groups[0].tracks.iter().map(|t| t.id).collect();
+    assert_eq!(group.len(), 2);
+    // The copy in a playlist is the one suggested to keep.
+    assert_eq!(group[0], id_of("b.wav"));
+
+    library
+        .merge_duplicates(id_of("a.wav"), &[id_of("b.wav")])
+        .unwrap();
+    // The playlist now holds the kept copy, and a scan does not bring the
+    // other back.
+    let in_set = TrackQuery {
+        playlist: Some(set.id),
+        ..Default::default()
+    };
+    assert_eq!(library.tracks(&in_set).unwrap()[0].id, id_of("a.wav"));
+    let summary = library.scan(source.id, |_| {}).unwrap();
+    assert_eq!(summary.added, 0);
+    assert_eq!(library.tracks(&TrackQuery::default()).unwrap().len(), 3);
+    assert!(dir.0.join("b.wav").exists());
+
+    // Files with the same audio and length but other tags count too.
+    std::fs::copy(dir.0.join("d.wav"), dir.0.join("e.wav")).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let groups = library.duplicate_groups().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].tracks.len(), 2);
+}
+
+#[test]
+fn years_are_read_and_filled_in_for_older_libraries() {
+    let dir = TempDir::new("years");
+    let path = dir.0.join("a.wav");
+    write_tagged(&path, "Old One", "A", "", "", "");
+    let mut tag = Tag::new(TagType::Id3v2);
+    tag.set_title("Old One".into());
+    // ID3v2 keeps the date in TDRC, as most taggers write it.
+    tag.insert_text(ItemKey::RecordingDate, "1997-05-01".into());
+    tag.save_to_path(&path, WriteOptions::default()).unwrap();
+
+    let db = dir.0.join("library.db");
+    let mut library = Library::open(&db).unwrap();
+    let source = library.add_folder(&dir.0).unwrap();
+    library.scan(source.id, |_| {}).unwrap();
+    let track = library.tracks(&TrackQuery::default()).unwrap().remove(0);
+    assert_eq!(track.year, Some(1997));
+    library.store_tempo(track.id, 3, None).unwrap();
+
+    // A library from before years were read gets them on its next scan,
+    // without the file counting as changed or needing analysis again.
+    drop(library);
+    let raw = rusqlite::Connection::open(&db).unwrap();
+    raw.execute_batch("UPDATE tracks SET year = NULL, year_checked = 0")
+        .unwrap();
+    drop(raw);
+    let mut library = Library::open(&db).unwrap();
+    let summary = library.scan(source.id, |_| {}).unwrap();
+    assert_eq!(summary.unchanged, 1);
+    let track = library.tracks(&TrackQuery::default()).unwrap().remove(0);
+    assert_eq!(track.year, Some(1997));
+    assert!(library.pending_tempo_analysis(3).unwrap().is_empty());
+    let decade = TrackQuery {
+        group: Some(Group::Decade(1990)),
+        ..Default::default()
+    };
+    assert_eq!(library.tracks(&decade).unwrap().len(), 1);
+}
+
+#[test]
 fn flows_place_and_trim_clips_on_lanes() {
     let dir = TempDir::new("flow");
     write_tagged(&dir.0.join("a.wav"), "First", "A", "", "120", "8A");
@@ -766,6 +1527,7 @@ fn flows_place_and_trim_clips_on_lanes() {
     let grid = TempoResult {
         bpm: 120.0,
         first_beat_seconds: 0.1,
+        downbeat: 0,
         confidence: 0.5,
     };
     library.store_tempo(first, 1, Some(grid)).unwrap();
